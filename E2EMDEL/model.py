@@ -17,7 +17,6 @@ logger = logging.getLogger(__name__)
 class MDEL(nn.Module):
     def __init__(self):
         super(MDEL, self).__init__()
-        config = BertConfig()
         self.wp_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
         self.bert =\
             BertForTokenClassification.from_pretrained('bert-base-uncased')

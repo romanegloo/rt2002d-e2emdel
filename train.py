@@ -7,6 +7,10 @@ Modify the configuration file () for experiments.
 
 import logging
 import configparser
+import code
+
+from E2EMDEL.data import KaggleNERDataset
+from E2EMDEL.model import MDEL
 
 logger = logging.getLogger(__name__)
 conf = configparser.ConfigParser()
@@ -19,4 +23,8 @@ if __name__ == '__main__':
     )
     logger.info('Reading the configuration file')
     conf.read('conf.ini')
-    print(conf['paths']['data_dir'])
+
+    ds = KaggleNERDataset()
+    model = MDEL()
+
+    code.interact(local=locals())

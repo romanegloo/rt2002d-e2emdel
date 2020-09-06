@@ -10,8 +10,6 @@ import code
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from pytorch_fast_elmo import FastElmo, batch_to_char_ids
-
 logger = logging.getLogger(__name__)
 
 class KaggleNERDataset(Dataset):
@@ -45,9 +43,4 @@ class KaggleNERDataset(Dataset):
 if __name__ == '__main__':
     ds = KaggleNERDataset()
     print(' '.join(ds.examples[0][0]))
-    char_ids = batch_to_char_ids(ds.examples[0][0])
-    options_file = 'data/elmo/elmo_2x2048_256_2048cnn_1xhighway_options.json'
-    weight_file = 'data/elmo/elmo_2x2048_256_2048cnn_1xhighway_weights.hdf5'
-    elmo = FastElmo(options_file, weight_file)
-    print(elmo(char_ids))
     code.interact(local=locals())
