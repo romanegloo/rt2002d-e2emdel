@@ -2,3 +2,4 @@ playground/
 .vscode/
 data/
 doc/
+__pycache__/
