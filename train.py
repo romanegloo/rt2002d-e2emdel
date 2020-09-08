@@ -10,8 +10,9 @@ import logging
 import argparse
 import code
 
-from torch.utils.data import DataLoader, RandomSampler
+import torch
 from torch import nn
+from torch.utils.data import DataLoader
 
 from GoshiBoshi.data import KaggleNERDataset, batchify
 from GoshiBoshi.model import JointMDEL
@@ -22,53 +23,34 @@ from transformers import AdamW, get_linear_schedule_with_warmup
 logger = logging.getLogger(__name__)
 
 
-def train(args, ds, mdl, crit, optim, sch):
+def train(args, ds, mdl, crit, optim, sch, stats):
     mdl.train()
-    steps = 0
-    for batch in DataLoader(ds['tr'],
-                            batch_size=args.batch_size,
-                            shuffle=True,
-                            collate_fn=batchify):
+    train_it = DataLoader(ds['tr'],
+                          batch_size=args.batch_size,
+                          shuffle=True,
+                          collate_fn=batchify)
+    stats.n_exs = len(train_it)
+    for batch in train_it:
         optim.zero_grad()
         outputs = mdl(batch)
-        loss = utils.compute_loss(crit, outputs[0], batch[1])
+
+        loss = utils.compute_loss(crit, outputs[0], batch[1].to(args.device))
         loss.backward()
         optim.step()
         nn.utils.clip_grad_norm_(mdl.parameters(), 10)
-        if steps % 5 == 0:
-            print(loss)
-        steps += 1
-# todo loss something like this
-# def compute_loss(logits, target, length):
-#     """
-#     Args:
-#         logits: A Variable containing a FloatTensor of size
-#             (batch, max_len, num_classes) which contains the
-#             unnormalized probability for each class.
-#         target: A Variable containing a LongTensor of size
-#             (batch, max_len) which contains the index of the true
-#             class for each corresponding step.
-#         length: A Variable containing a LongTensor of size (batch,)
-#             which contains the length of each data in a batch.
-#     Returns:
-#         loss: An average loss value masked by the length.
-#     """
+        sch.step()
 
-#     # logits_flat: (batch * max_len, num_classes)
-#     logits_flat = logits.view(-1, logits.size(-1))
-#     # log_probs_flat: (batch * max_len, num_classes)
-#     log_probs_flat = functional.log_softmax(logits_flat)
-#     # target_flat: (batch * max_len, 1)
-#     target_flat = target.view(-1, 1)
-#     # losses_flat: (batch * max_len, 1)
-#     losses_flat = -torch.gather(log_probs_flat, dim=1, index=target_flat)
-#     # losses: (batch, max_len)
-#     losses = losses_flat.view(*target.size())
-#     # mask: (batch, max_len)
-#     mask = _sequence_mask(sequence_length=length, max_len=target.size(1))
-#     losses = losses * mask.float()
-#     loss = losses.sum() / length.float().sum()
-#     return loss
+        stats.update(loss.item())
+
+        # Update stats
+        if stats.steps % args.log_interval == 0:
+            stats.lr = optim.param_groups[0]['lr']
+            stats.report()
+
+
+
+        
+
 
 if __name__ == '__main__':
     # Configuration -----------------------------------------------------------
@@ -96,19 +78,21 @@ if __name__ == '__main__':
                         help='Dataset to which model will fit')
     parser.add_argument('--lr', type=float, default=1e-5,
                         help='Default learning rate')
-    parser.add_argument('--num_warmup_steps', type=int, default=5000,
+    parser.add_argument('--num_warmup_steps', type=int, default=0,
                         help='Number of steps for warmup in optimize schedule')
-    parser.add_argument('--num_training_steps', type=int, default=200000,
+    parser.add_argument('--num_training_steps', type=int, default=0,
                         help='Number of steps for training')
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Number of examples in running train/valid steps')
+    parser.add_argument('--max_sent_len', type=int, default=256,
+                        help='Maximum sequence length')
                         
     # Runtime environmnet
     parser.add_argument('--epochs', type=int, default=5,
                         help='Number of epochs to train')
-    parser.add_argument('--log_interval', type=int, default=1000,
+    parser.add_argument('--log_interval', type=int, default=100,
                         help='Log interval for training')
-    parser.add_argument('--eval_interval', type=int, default=20000,
+    parser.add_argument('--eval_interval', type=int, default=2000,
                         help='Log interval for validation')
 
     args = parser.parse_args()
@@ -122,6 +106,12 @@ if __name__ == '__main__':
 
     # Set random seed
     utils.set_seed(args.random_seed)
+    # GPU
+    if torch.cuda.is_available():
+        args.device = torch.device('cuda:0')
+    else:
+        args.device = torch.device('cpu')
+    
 
     # Read a tokenizer (vocab is defined in the tokenizer)
     tokenizer = utils.get_tokenizer(args.model_name)
@@ -131,9 +121,14 @@ if __name__ == '__main__':
         KaggleNERDataset(examples=exs, tokenizer=tokenizer) for exs in
         utils.csv_to_ner_split_examples(args)
     )
+    if args.num_training_steps == 0:
+        args.num_training_steps = \
+            int(len(ds['tr']) / args.batch_size) * args.epochs
+    if args.num_warmup_steps == 0:
+        args.num_warmup_steps = int(args.num_training_steps * .05)
 
     # Model
-    model = JointMDEL(args)
+    model = JointMDEL(args).to(args.device)
     criterion = nn.NLLLoss(ignore_index=-1, reduction='none')
     optimizer = AdamW(model.parameters(), lr=float(args.lr))
     scheduler = get_linear_schedule_with_warmup(
@@ -143,7 +138,12 @@ if __name__ == '__main__':
     )
 
     # Train -------------------------------------------------------------------
+    stats = utils.TraningStats()
     model.train()
     for epoch in range(1, args.epochs + 1):
-        train(args, ds, model, criterion, optimizer, scheduler)
+        stats.epoch = epoch
+        logger.info('*** Epoch {} starts ***'.format(epoch))
+        train(args, ds, model, criterion, optimizer, scheduler, stats)
         break
+
+# inference? (check this https://www.kaggle.com/abhishek/entity-extraction-model-using-bert-pytorch)

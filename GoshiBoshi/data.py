@@ -4,15 +4,11 @@ DataLoader, Reads in training examples for mention detection and entity linking
 """
 
 import logging
-import csv
 import code
-import random
 from itertools import accumulate
-from collections import defaultdict
 
-import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
 import GoshiBoshi.utils as utils
@@ -27,13 +23,7 @@ class KaggleNERDataset(Dataset):
          'B-nat', 'I-nat']
     )}
     def __init__(self, examples, tokenizer):
-        """
-        Kaggle NER Example:
-        Sentence # | Word | POS | Tag
-        Sentence: 1 | Thousands | NNS | O
-                    | of | IN | O
-        """
-        self.examples = examples 
+        self.examples = examples
         self.tokenizer = tokenizer
 
     def __len__(self):
@@ -94,7 +84,7 @@ class KaggleNERDataset(Dataset):
         subword_ids = self.tokenizer.convert_tokens_to_ids(subwords)
         return subword_ids, token_start_idxs
 
-def batchify(batch):
+def batchify(batch, device='cuda:0'):
     inputs = [torch.tensor(ex[0], dtype=torch.long) for ex in batch]
     inputs = pad_sequence(inputs, batch_first=True)
     labels = [torch.tensor(ex[1], dtype=torch.long) for ex in batch]

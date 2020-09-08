@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 class JointMDEL(nn.Module):
     def __init__(self, args, num_classes=17):
         super(JointMDEL, self).__init__()
+        self.args = args
         self.bert = AutoModelForTokenClassification.from_pretrained(
             'allenai/scibert_scivocab_uncased'
         )
@@ -27,5 +28,7 @@ class JointMDEL(nn.Module):
 
     def forward(self, data):
         inp, tgt, segs, masks = data
-        logits = self.bert(inp, attention_mask=masks, token_type_ids=segs)
+        logits = self.bert(inp.to(self.args.device),
+                           attention_mask=masks.to(self.args.device),
+                           token_type_ids=segs.to(self.args.device))
         return logits

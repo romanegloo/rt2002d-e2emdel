@@ -6,12 +6,16 @@ Classes and methods used in common
 from collections import defaultdict
 import random
 import csv
+import logging
 
 import numpy as np
 import torch
 from torch.nn import functional as F
 
 from transformers import AutoModel, AutoTokenizer
+
+logger = logging.getLogger(__name__)
+
 
 def set_seed(seed, n_gpu=0):
     random.seed(seed)
@@ -31,13 +35,24 @@ def get_bert_model(mdl_name):
 def csv_to_ner_split_examples(args, split_ranges=[0., .8, .9]):
     examples = []
     if args.dataset == 'KaggleNER':
+        """
+        Kaggle NER Example:
+        Sentence # | Word | POS | Tag
+        Sentence: 1 | Thousands | NNS | O
+                    | of | IN | O
+        """
         with open(args.path_ds_kaggle, encoding='latin1') as f:
             next(f)
             reader = csv.reader(f)
+            sent_len = 0
             for l in reader:
                 if l[0] != '':
+                    sent_len = len(l[1]) + 1
                     examples.append(([l[1]], [l[2]], [l[3]]))
                 else:
+                    sent_len += len(l[1]) + 1
+                    if sent_len >= args.max_sent_len:
+                        continue
                     examples[-1][0].append(l[1])
                     examples[-1][1].append(l[2])
                     examples[-1][2].append(l[3])
@@ -77,25 +92,29 @@ def compute_loss(criterion, logits, targets, pad_index=-1):
 
     return loss
 
-# class WVModel:
-#     """WordVector Model"""
-#     def __init__(self, vocab_size=0):
-#         self.vocab_size = vocab_size
-#         self.sym2idx = defaultdict(lambda: len(self.sym2idx))
-#         self.idx2sym = dict()
-#         self.emb = None
+class TraningStats:
+    def __init__(self):
+        self.epoch = 0
+        self.steps = 1
+        self.n_exs = 0
+        self.lr = 0
+        self.train_loss_log = []
+        self.valid_loss_log = []
+        self.cum_train_loss = []
     
-#     def __len__(self):
-#         return len(self.sym2idx)
+    def update(self, loss):
+        self.steps += 1
+        self.cum_train_loss.append(loss)
     
-#     def __getitem__(self, k):
-#         if isinstance(k, int):
-#             return self.idx2sym[k]
-#         elif isinstance(k, str):
-#             return self.sym2idx[k]
-#         else:
-#             return
-
-#     def close(self):
-#         self.sym2idx = defaultdict(lambda: self.sym2idx['UNK'], self.sym2idx)
-#         self.vocab_size = len(self)
+    def report(self, mode='tr'):
+        if mode == 'tr':
+            loss_ = sum(self.cum_train_loss) / len(self.cum_train_loss)
+            self.cum_train_loss = []
+            msg = (
+                'Epoch {} Steps {:>5}/{} -- loss {:.3f}, lr {:.8f}'
+                ''.format(self.epoch, self.steps, self.n_exs, loss_, self.lr)
+            )
+        elif mode == 'va':
+            pass
+        logger.info(msg)
+            
