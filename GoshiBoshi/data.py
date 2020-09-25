@@ -6,6 +6,7 @@ DataLoader, Reads in training examples for mention detection and entity linking
 import logging
 import code
 from itertools import accumulate
+import pickle
 
 import torch
 from torch.utils.data import Dataset
@@ -15,6 +16,30 @@ import GoshiBoshi.utils as utils
 # import utils
 
 logger = logging.getLogger(__name__)
+
+class MedMentionDataset(Dataset):
+
+    def __init__(self, exs, mode):
+        self.examples = [rec for rec in exs['examples'] if rec['ds'] == mode]
+        self.typeIDs = ['O'] + exs['typeIDs']  # 'O' for no-type 
+        self.typeID2idx = {k: i for (i, k) in enumerate(self.typeIDs)}
+        self.entityIDs = ['O'] + exs['UMLS_concepts']  # 'O' for no-entity
+        self.entityID2idx = {k: i for (i, k) in enumerate(self.entityIDs)}
+        self.bert_special_tokens_map = exs['bert_special_tokens_map']
+
+    def __len__(self):
+        return(len(self.examples))
+
+    def __getitem__(self, idx):
+        ex = self.examples[idx]
+        x = [self.bert_special_tokens_map['[CLS]']] + ex['token_ids']
+        y1 = [self.typeID2idx['O']] * (len(ex['tokens']) + 1)
+        y2 = [self.entityID2idx['O']] * (len(ex['tokens']) + 1)
+        for (bi, l, _, typeid, entid) in ex['annotations']:
+            y1[bi+1:bi+1+l] = [self.typeID2idx[typeid]] * l
+            y2[bi+1:bi+1+l] = [self.entityID2idx[entid]] * l
+        return x, y1, y2
+
 
 class KaggleNERDataset(Dataset):
     lbl2idx = {k: i for i, k in enumerate(

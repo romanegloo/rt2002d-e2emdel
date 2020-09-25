@@ -11,3 +11,10 @@
 |------------|------|-----|-----|
 | Setence: 1 | Thousands | NNS | O |
 | | of | IN | O |
+
+## PubTatorCentral
+
+PubTatorCentral dataset contains automatic annotations of biomedical concepts in PubMed abstracts 
+and PMC full-text articles. Download 
+[this (13G)](ftp://ftp.ncbi.nlm.nih.gov/pub/lu/PubTatorCentral/bioconcepts2pubtatorcentral.offset.gz) 
+which contains annotation offset information.
