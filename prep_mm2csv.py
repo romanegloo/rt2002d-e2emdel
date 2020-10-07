@@ -21,7 +21,7 @@ examples = {
     'typeIDs': [T001, T04, ..., Txx]
 }
 """
-from typing import List
+from typing import List, DefaultDict, Dict
 import gzip
 import re
 import logging
@@ -30,17 +30,26 @@ from operator import add
 import code
 from tqdm import tqdm
 import pickle
-from collections import Counter
+from collections import Counter, defaultdict
 
 from nltk.tokenize import sent_tokenize
-from transformers import AutoTokenizer
+
+import torch
+from torch.nn.utils.rnn import pad_sequence
+from transformers import AutoTokenizer, AutoModel
+
+import GoshiBoshi.utils as utils
 
 
 MM_FILE = 'data/MedMentions/corpus_pubtator.txt.gz'
 MM_pmids_trn = 'data/MedMentions/corpus_pubtator_pmids_trng.txt'
 MM_pmids_dev = 'data/MedMentions/corpus_pubtator_pmids_dev.txt'
 MM_pmids_tst = 'data/MedMentions/corpus_pubtator_pmids_test.txt'
+MRCONSO_FILE = 'data/UMLS/MRCONSO.RRF'
+MRSTY_FILE = 'data/UMLS/MRSTY.RRF'
 MM_OUT_FILE = 'data/MedMentions/mm.pkl'
+BERT_MDL_DIM = 768
+
 logger = logging.getLogger(__name__)
 
 def proc_doc(tokenizer, doc):
@@ -156,6 +165,22 @@ def proc_doc(tokenizer, doc):
         
     return examples, [annt[-1] for annt in annotations]
     
+def var_mean(hs, lengths):
+    """Given the hidden states and the lengths in batch, compute the mean of the vectors. Assume that `hs` is in (N x L x D) and l in (N)
+    Output is in (N x D)
+    """
+    device = hs.device
+    if isinstance(lengths, list):
+        lengths = torch.tensor(lengths)
+    n, l, d = hs.size()
+    ll = lengths + torch.arange(n) * l
+    b = torch.arange(n * l).view(n, l)
+    b = (b < ll.view(n, 1) - 1).to(device)
+    lengths = lengths.unsqueeze(1).to(device)
+    mean = (hs * b.view(n, l, 1).float())[:,1:].sum(1) / lengths
+    return mean
+
+
 if __name__ == '__main__':
     # Logger
     logging.basicConfig(
@@ -166,7 +191,9 @@ if __name__ == '__main__':
 
     # Read from the MedMention datafile
     # Load BERT tokenizer
-    tokenizer = AutoTokenizer.from_pretrained('allenai/scibert_scivocab_uncased')
+    tokenizer = AutoTokenizer.from_pretrained('allenai/scibert_scivocab_cased')
+    # MB for the beginning of mention and ME for the ending of mention
+    tokenizer.add_special_tokens({'bos_token': '[MB]', 'eos_token': '[ME]'})
 
     data = dict.fromkeys(['examples', 'typeIDs', 'bert_special_tokens_map'])
     data['examples'] = []
@@ -175,12 +202,17 @@ if __name__ == '__main__':
     data['typeIDs'] = [f'T{t:03}' for t in 
                        [5, 7, 17, 22, 31, 33, 37, 38, 58, 62, 74, 82, 91, 92,
                         97, 98, 103, 168, 170, 201, 204]]
+    data['ontology_abbr'] = ['CPT', 'FMA', 'GO', 'HGNC', 'HPO', 'ICD10',
+                            'ICD10CM', 'ICD9CM', 'MDR', 'MSH', 'MTH', 'NCBI',
+                            'NCI', 'NDDF', 'NDFRT', 'OMIM', 'RXNORM',
+                            'SNOMEDCT_US']
         # Types are defined [here](https://tinyurl.com/y49oovcw)
 
     # data['UMLS_concepts'] = defaultdict(lambda: len(data['UMLS_concepts']))
 
     a_doc: List[str] = []
-    concept_counter = Counter()
+    concept_counter: Dict[str, int] = Counter()
+    logger.info('Reading MedMention dataset...')
     pbar = tqdm(total=216458)
     with gzip.open(MM_FILE, 'rt', encoding='utf-8') as f:
         while True:
@@ -196,8 +228,9 @@ if __name__ == '__main__':
             else:
                 a_doc.append(line)
     pbar.close()
+    logger.info(f'{len(concept_counter)} unique concepts found in the examples' )
 
-    data['UMLS_concepts'] = list(concept_counter.keys())
+    # data['UMLS_concepts'] = list(concept_counter.keys())
 
     # For each example, assign dataset mode [trn/dev/tst] according to the
     # original split (https://tinyurl.com/y2yujq2o)
@@ -214,8 +247,95 @@ if __name__ == '__main__':
         else:
             logger.warning('pmid {} does not exist in any of the datsets')
 
-                
+    # Read UMLS concepts that belong to st21pv semantic types
+    st21pv_cuis = set()
+    with open(MRSTY_FILE) as f:
+        for line in f:
+            flds = line.split('|')
+            if flds[1] in data['typeIDs']:
+                st21pv_cuis.add(flds[0])
+    logger.info('{} CUIs found for the given semantic types'
+                ''.format(len(st21pv_cuis)))
+    
+    # Read UMLS concepts and build the concept name normalization vectors
+    logger.info('Loading SciBERT model...')
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+    mdl = AutoModel.from_pretrained('allenai/scibert_scivocab_cased', 
+                                    output_hidden_states=True)
+    mdl.to(device)
+    mdl.eval()
+    # MM-ST21pv contains 2,327,250 concepts. We create a sufficiently large
+    # number of spaces for the name norm space
+    norm_space = torch.empty((3000000, BERT_MDL_DIM))
+    norm_space_s = torch.empty((2*len(concept_counter), BERT_MDL_DIM))
+    ni2cui: List[str] = []
+    ni2cui_s: List[str] = []
+    cui2ni: DefaultDict[str, list] = defaultdict(list)
+    cui2ni_s: DefaultDict[str, list] = defaultdict(list)
+    
+    bsz = 256
+    batch: List[torch.Tensor] = []  # batch of cui names
+    cnt, cnt_s = 0, 0
+    pbar = tqdm(total=15479756)
+    with torch.no_grad(), open(MRCONSO_FILE) as f:
+        for (ln, line) in enumerate(f):
+            pbar.update()
+            flds = line.split('|')
+            if flds[0] not in st21pv_cuis or \
+                    flds[1] != 'ENG' or \
+                    flds[4] != 'PF' or \
+                    flds[11] not in data['ontology_abbr']:
+                continue
+            inp = tokenizer.encode(flds[14])  # name
+            ni2cui.append(flds[0])
+            cui2ni[flds[0]].append(cnt)
+            cnt += 1
+            batch.append(torch.tensor(inp))
+            if len(batch) == bsz:
+                inp_lengths = [len(x) for x in batch]
+                inputs = pad_sequence(batch, batch_first=True).to(device)
+                masks = \
+                    utils.sequence_mask(inp_lengths, inputs.size(1)).to(device)
+                _, _, output = mdl(inputs, attention_mask=masks)
+                mean = var_mean(output[-2], inp_lengths)
+                mean = mean.to('cpu')
+                norm_space[cnt-bsz:cnt] = mean
+                for (i, cui) in enumerate(ni2cui[-bsz:]):
+                    if f'UMLS:{cui}' in concept_counter:
+                        norm_space_s[cnt_s] = mean[i]
+                        ni2cui_s.append(cui)
+                        cui2ni_s[cui].append(cnt_s)
+                        cnt_s += 1
+                batch = []
+                        
+        # Remainders in batch
+        if len(batch) > 0:
+            inp_lengths = [len(x) for x in batch]
+            inputs = pad_sequence(batch, batch_first=True).to(device)
+            masks = utils.sequence_mask(inp_lengths, inputs.size(1)).to(device)
+            _, _, output = mdl(inputs, attention_mask=masks)
+            mean = var_mean(output[-2], inp_lengths).to('cpu')
+            norm_space[cnt-len(batch):cnt] = mean
+            for (i, cui) in enumerate(ni2cui[-len(batch):]):
+                if f'UMLS:{cui}' in concept_counter:
+                    norm_space_s[cnt_s] = mean[i]
+                    ni2cui_s.append(cui)
+                    cui2ni_s[cui].append(cnt_s)
+                    cnt_s += 1
+            batch = []
+    pbar.close()
+    logger.info(f'UMLS concept definitions (total: {len(ni2cui)}'
+                f'sub: {len(ni2cui_s)}) found')
+    # norm_space = norm_space[:cnt]
+    data['entity_names'] = norm_space_s[:cnt_s]
+    data['ni2cui'] = ni2cui_s
+    data['cui2ni'] = cui2ni_s
+
     # Saving processed examples
     logger.info('Saving {} examples into {}'
                 ''.format(len(data['examples']), MM_OUT_FILE))
     pickle.dump(data, open(MM_OUT_FILE, 'wb'))
+            
