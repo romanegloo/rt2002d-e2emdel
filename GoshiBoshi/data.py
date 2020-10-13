@@ -22,16 +22,20 @@ logger = logging.getLogger(__name__)
 class MedMentionDataset(Dataset):
 
     def __init__(self, exs, mode, max_sent_len=160):
+        self.mode = mode
         self.examples = [rec for rec in exs['examples'] if rec['ds'] == mode]
-        self.typeIDs = list('IOB') + exs['typeIDs'] + ['N']  # 'N' for no class
-        self.typeID2idx = {k: i for (i, k) in enumerate(self.typeIDs)}
+        self.tags = 'IOB'
+        self.tag2idx = {t: i for i, t in enumerate(self.tags)}
+        self.types = exs['typeIDs'] + ['N']  # 'N' for no class
+        self.type2idx = {k: i for (i, k) in enumerate(self.types)}
         self.names = exs['ni2cui'] + ['N']
         self.cui2idx = defaultdict(list)
         self.cui2idx['N'] = [len(exs['ni2cui'])]
-        for k, v in exs['cui2ni'].items():
-            self.cui2idx[k] = v
+        for i, cui in enumerate(exs['ni2cui']):
+            self.cui2idx[cui].append(i)
         self.bert_special_tokens = exs['bert_special_tokens_map']
         self.max_sent_len = max_sent_len
+        self.not_found = set()
 
     def __len__(self):
         return(len(self.examples))
@@ -45,21 +49,26 @@ class MedMentionDataset(Dataset):
         """
         ex = self.examples[idx]
         src_len = len(ex['token_ids'][:self.max_sent_len])
-        # x = torch.tensor([self.bert_special_tokens['[ME]'],
-        #                   self.bert_special_tokens['[MB]'],
-        #                   0]).repeat(src_len)
-        x = torch.tensor([self.bert_special_tokens['[MASK]'], 0]).repeat(src_len)
-        for i, v in enumerate(ex['token_ids'][:self.max_sent_len]):
-            x[2*i+1] = v
-        x = torch.cat((torch.tensor([self.bert_special_tokens['[CLS]']]), x,
-                       torch.tensor([self.bert_special_tokens['[SEP]']])))
+        # x = torch.tensor([self.bert_special_tokens['[MASK]'], 0]).repeat(src_len)
+        # for i, v in enumerate(ex['token_ids'][:self.max_sent_len]):
+        #     x[2*i+1] = v
+        x = torch.tensor([self.bert_special_tokens['[CLS]']] + 
+                         ex['token_ids'][:self.max_sent_len] + 
+                         [self.bert_special_tokens['[SEP]']])
+        if self.mode == 'tst':
+            return x, src_len, ex['annotations']
 
-        t_i, t_o, t_b = (self.typeID2idx[k] for k in 'IOB')
-        t_n, e_n = self.typeID2idx['N'], self.cui2idx['N']
+        g_i, g_o, g_b = (self.tag2idx[g] for g in 'IOB')
+        t_n, e_n = self.type2idx['N'], self.cui2idx['N']
+
+        # Tagging labels (IOB)
+        y0 = torch.zeros(len(self.tags), dtype=torch.bool)
+        y0[g_o] = True
+        y0 = y0.repeat(src_len, 1)
 
         # Entity type labels (list of entity IDs over tokens)
-        y1 = torch.zeros(len(self.typeIDs), dtype=torch.bool)
-        y1[t_o], y1[t_n] = True, True
+        y1 = torch.zeros(len(self.types), dtype=torch.bool)
+        y1[t_n] = True
         y1 = y1.repeat(src_len, 1)
 
         # Entity name labels
@@ -70,36 +79,44 @@ class MedMentionDataset(Dataset):
         for (bi, l, m, typeid, entid) in ex['annotations']:
             if bi+l-1 >= self.max_sent_len:
                 continue
-            t = self.typeID2idx[typeid]
-            e = self.cui2idx[entid[5:]]
-            y1[bi:bi+l, t], y1[bi+1:bi+l, t_i]= True, True
-            y1[bi:bi+l, t_o], y1[bi:bi+l, t_n] = False, False
-            y1[bi, t_b] = True
+            t = self.type2idx[typeid]
+            cui = entid[5:]
+            if cui not in self.cui2idx:
+                self.not_found.add(cui)
+            e = self.cui2idx[cui]
+            y0[bi, g_b], y0[bi+1:bi+l, g_i], y0[bi:bi+l, g_o] = True, True, False
+            y1[bi:bi+l, t], y1[bi:bi+l, t_n]= True, False
             y2[bi:bi+l, e], y2[bi:bi+l, e_n] = True, False
-            # y1[b, t], y1[b, to] = True, False
-            # y2[a:b+1, e], y2[a:b+1, no] = True, False
-            # y2[b, e], y2[b, no] = True, False  # check this works
         
-        return x, y1, y2, src_len
+        return x, src_len, y0, y1, y2
+            
 
 
 def batchify(batch):
+    tst = True if len(batch[0]) == 3 else False
+
     N = len(batch)
-    C1 = batch[0][1].size(-1)
-    C2 = batch[0][2].size(-1)
     x = [ex[0] for ex in batch]
     x = pad_sequence(x, batch_first=True)
-    x_lengths = [2*ex[3]+2 for ex in batch]
-    y_lengths = [ex[3] for ex in batch]
+    x_lens = [ex[1]+2 for ex in batch]
+    y_lens = [ex[1] for ex in batch]
     segs = torch.zeros_like(x)
-    x_mask = utils.sequence_mask(x_lengths, max(x_lengths))
-    y1_mask = torch.zeros(N, max(y_lengths), C1, dtype=torch.bool)
-    y2_mask = torch.zeros(N, max(y_lengths), C2, dtype=torch.bool)
-    for i, ex in enumerate(batch):
-        y1_mask[i,:y_lengths[i],:] = ex[1]
-        y2_mask[i,:y_lengths[i],:] = ex[2]
+    x_mask = utils.sequence_mask(x_lens, max(x_lens))
+    if tst:
+        annt = [ex[2] for ex in batch]
+        return x, segs, x_mask, annt
 
-    return x, segs, x_mask, y1_mask, y2_mask
+    C0, C1, C2 = [batch[0][i+2].size(-1) for i in range(3)]
+    # todo shouldn't be filled with null class index?
+    y0_mask = torch.zeros(N, max(y_lens), C0, dtype=torch.bool)
+    y1_mask = torch.zeros(N, max(y_lens), C1, dtype=torch.bool)
+    y2_mask = torch.zeros(N, max(y_lens), C2, dtype=torch.bool)
+    for i, ex in enumerate(batch):
+        y0_mask[i,:y_lens[i],:] = ex[2]
+        y1_mask[i,:y_lens[i],:] = ex[3]
+        y2_mask[i,:y_lens[i],:] = ex[4]
+
+    return x, segs, x_mask, y0_mask, y1_mask, y2_mask
 
 
 class KaggleNERDataset(Dataset):

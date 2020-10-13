@@ -3,11 +3,12 @@ utils.py
 
 Classes and methods used in common
 """
-from collections import defaultdict
+from collections import defaultdict, Counter
 import random
 import csv
 import logging
 import code
+import os
 
 import numpy as np
 import torch
@@ -27,11 +28,11 @@ def set_seed(seed, n_gpu=0):
         
 def get_tokenizer(mdl_name):
     if mdl_name == 'SciBERT':
-        return AutoTokenizer.from_pretrained('allenai/scibert_scivocab_uncased')
+        return AutoTokenizer.from_pretrained('allenai/scibert_scivocab_cased')
 
 def get_bert_model(mdl_name):
     if mdl_name == 'SciBERT':
-        return AutoModel.from_pretrained('allenai/scibert_scivocab_uncased')
+        return AutoModel.from_pretrained('allenai/scibert_scivocab_cased')
 
 def csv_to_ner_split_examples(args, split_ranges=[0., .8, .9]):
     examples = []
@@ -79,64 +80,68 @@ def sequence_mask(lengths, max_len=None):
             .repeat(batch_size, 1)
             .lt(lengths.unsqueeze(1)))
 
-def compute_loss(logits, y1, y2, norm_space):
-    out_type, out_ent = logits
-    out_type = out_type.to('cpu')
-    out_ent = out_ent.to('cpu')
-    N, L, C1 = out_type.size()
-    marker_idx = torch.tensor([i for i in range(L-1) if i%2!=0])
-    out_type = out_type.index_select(1, marker_idx)
-    out_ent = out_ent.index_select(1, marker_idx)
+# def compute_loss(logits, y0, y1, y2, norm_space):
+#     out_tag, out_type, out_ent = (out.to('cpu') for out in logits)
+#     N, L, C1 = out_type.size()
+#     # marker_idx = torch.tensor([i for i in range(L-1) if i%2!=0])
+#     # out_type = out_type.index_select(1, marker_idx)
+#     # out_ent = out_ent.index_select(1, marker_idx)
 
-    # NLLLoss over entity types
-    log_probs_iob = F.log_softmax(out_type[:,:,:3], dim=-1)
-    log_probs_type = F.log_softmax(out_type[:,:,3:], dim=-1)
+#     # Log likelihood
+#     log_probs_tag = F.log_softmax(out_tag, dim=-1)
+#     log_probs_type = F.log_softmax(out_type, dim=-1)
+#     out_ent = torch.cat((log_probs_type[:,:,:-1], out_ent), dim=-1)
+#     norm_scores = torch.matmul(out_ent, norm_space.T)
+#     log_probs_name = F.log_softmax(norm_scores, dim=-1)
 
-    rho = 0.1
-    loss1 = -(log_probs_iob[:,:,1] * y1.long()[:,:,1]).sum() * rho
-    loss1 += -(log_probs_iob[:,:,[0,2]] * y1.long()[:,:,[0,2]]).sum() * (1-rho) 
-    loss1 /= y1.sum()
+#     rho = 0.1
+#     # NLLLoss of tags
+#     loss0 = -(log_probs_tag[:,1:-1,1] * y0.long()[:,:,1]).sum() * rho
+#     loss0 += -(log_probs_tag[:,1:-1,[0,2]] * y1.long()[:,:,[0,2]]).sum() * (1-rho) 
+#     loss0 /= y1.sum()
 
-    loss2 = -(log_probs_type[:,:,-1] * y1.long()[:,:,-1]).sum() * rho
-    loss2 += -(log_probs_type[:,:,:-1] * y1.long()[:,:,3:-1]).sum() * (1-rho)
-    loss2 /= y1.sum()
+#     # NLLLoss of entity types
+#     loss1 = -(log_probs_type[:,1:-1,-1] * y1.long()[:,:,-1]).sum() * rho
+#     loss1 += -(log_probs_type[:,1:-1,:-1] * y1.long()[:,:,:-1]).sum() * (1-rho)
+#     loss1 /= y1.sum()
 
-    # loss1 = -(log_probs[:,:,:-1] * y1.long()[:,:,:-1]).sum()
-    # loss1 += -(log_probs[:,:,-1] * y1.long()[:,:,-1]).sum() * .1
-    # loss1 /= y1.sum()
+#     # NLLLoss of entity names 
+#     loss2 = -(log_probs_name[:,1:-1,-1] * y2.long()[:,:,-1]).sum() * rho
+#     loss2 += -(log_probs_name[:,1:-1,:-1] * y2.long()[:,:,:-1]).sum() * (1-rho)
+#     loss2 /= y1.sum()
 
-    # NLLLoss over entity names 
-    norm_scores = torch.matmul(out_ent, norm_space.T)
-    log_probs = F.log_softmax(norm_scores, dim=-1)
-    loss3 = -(log_probs[:,:,-1] * y2.long()[:,:,-1]).sum() * rho
-    loss3 += -(log_probs[:,:,:-1] * y2.long()[:,:,:-1]).sum() * (1-rho)
-    loss3 /= y1.sum()
+#     return loss0, loss1, loss2
 
-    return (loss1+loss2+loss3), loss1, loss2, loss3
-
-def compute_retrieval_scores(logits, y1, y2, x_mask,
-                             y1_null_idx=1, y2_null_idx=30415):
+def compute_retrieval_scores(logits, x_mask, y1, y2, name_norm):
     """
+    measure micro retrieval performance
+    
     precision: the percentage of mentions predicted that are correct
     recall: the percentage of entities present in the corpus that are found
             by the model
     """
-    out_type, out_ent = logits
-    out_type = out_type.to('cpu')
-    out_ent = out_ent.to('cpu')
-    N, L, C1 = out_type.size()
-    marker_idx = torch.tensor([i for i in range(L-1) if i%2!=0])
-    out_type = out_type.index_select(1, marker_idx)
-    out_type = out_type[:,:,3:]
-    out_ent = out_ent.index_select(1, marker_idx)
-    x_mask = x_mask.index_select(1, marker_idx)
+    out_tag, out_type, out_ent = (out[:,1:-1,:].to('cpu') for out in logits)
+    x_mask = x_mask[:,1:-1]
+    # marker_idx = torch.tensor([i for i in range(L-1) if i%2!=0])
+    # out_type = out_type.index_select(1, marker_idx)
+    # out_type = out_type[:,:,3:]
+    # out_ent = out_ent.index_select(1, marker_idx)
+    # x_mask = x_mask.index_select(1, marker_idx)
 
     scores = []
     epsilon = 1e-7
-    for (out, y, null_idx) in ((out_type, y1, y1_null_idx),
-                               (out_ent, y2, y2_null_idx)):
-        pred = out.argmax(dim=-1)
+    logprobs_type = F.log_softmax(out_type, dim=-1)
+    for (out, y, norm) in ((out_type, y1, None),
+                           (out_ent, y2, name_norm)):
+        if norm is not None:
+            out = torch.cat((logprobs_type[:,:,:-1], out_ent), dim=-1)
+            norm_scores = torch.matmul(out, norm.T)
+            pred = norm_scores.argmax(dim=-1)
+        else:
+            pred = out.argmax(dim=-1)
         gt = y.long().argmax(dim=-1)
+        # Assume that the last idx is for the null class
+        null_idx = y.size(-1) - 1
         pred_mask = (pred != null_idx).logical_and(x_mask)
         gt_mask = (gt != null_idx).logical_and(x_mask)
 
@@ -151,28 +156,88 @@ def compute_retrieval_scores(logits, y1, y2, x_mask,
 
     return scores
 
+def infer_ret(logits, x_mask, annotations, name_space, types, names):
+    logits_tag, logits_type, prj_name = (t[:,1:-1,:] for t in logits)
+    dev = logits_tag.device
+    name_space = name_space.to(dev)
+
+    logits_tag = logits_tag.argmax(dim=-1)
+
+    logprobs_type = F.log_softmax(logits_type, dim=-1)
+    logits_type = logits_type.argmax(dim=-1)
+
+    prj_name = torch.cat((logprobs_type[:,:,:-1], prj_name), dim=-1)
+    name_scores = torch.matmul(prj_name, name_space.T)
+    name_scores = name_scores.argmax(dim=-1)
+
+    annt_dict = dict()
+    for i, annts in enumerate(annotations):
+        for bi, l, _, t, n in annts:
+            annt_dict[(i, bi, l)] = (t, n[5:])
+
+    pred_dict = dict()
+    mention = None
+    for i, ex in enumerate(logits_tag):
+        for j, idx in enumerate(ex):
+            if j == x_mask[i].sum():
+                break
+            ti = logits_type[i,j].item()
+            ei = name_scores[i,j].item()
+            if idx == 0:  # I
+                if mention is not None:
+                    mention[1] += 1
+                    mention[2].append(ti)
+                    mention[3].append(ei)
+            elif idx == 1:  # O
+                if mention is not None:
+                    pred_dict[(i, *mention[:2])] = (mention[2], mention[3])
+                    mention = None
+            elif idx == 2:  # B
+                if mention is not None:
+                    pred_dict[(i, *mention[:2])] = (mention[2], mention[3])
+                    mention = None
+                mention = [j, 1, [ti], [ei]]
+        if mention is not None:
+            pred_dict[(i, *mention[:2])] = (mention[2], mention[3])
+            mention = None
+
+    tp, fp, fn = 0, 0, 0
+    for pk, (tl, el) in pred_dict.items():
+        if pk in annt_dict:
+            t_maj = Counter(tl).most_common()[0][0]
+            n_maj = Counter(el).most_common()[0][0]
+            if types[t_maj] == annt_dict[pk][0] and \
+                    names[n_maj] == annt_dict[pk][1]:
+                tp += 1
+            else:
+                fp += 1
+        else:
+            fp += 1
+    fn = len(annt_dict) - tp
+    
+    return tp, fp, fn
+
 class TraningStats:
     def __init__(self):
         self.epoch = 0
         self.steps = 1
         self.n_exs = 0
         self.lr = 0
-        self.cum_trn_loss1 = []
-        self.cum_trn_loss2 = []
-        self.cum_dev_loss1 = []
-        self.cum_dev_loss2 = []
+        self.cum_losses_trn = [[], [], []]
+        self.cum_losses_dev = [[], [], []]
         self.best_dev_loss = 999999
         self.ret_scores_type = []
         self.ret_scores_entity = []
     
-    def update(self, loss1, loss2, ret_scores=None, mode='trn'):
+    def update(self, losses, ret_scores=None, mode='trn'):
+        loss0, loss1, loss2 = losses
         if mode == 'trn':
             self.steps += 1
-            self.cum_trn_loss1.append(loss1.item())
-            self.cum_trn_loss2.append(loss2.item())
+            for loss, cum in zip(losses, self.cum_losses_trn):
+                cum.append(loss.item())
         else:
-            self.cum_dev_loss1.append(loss1.item())
-            self.cum_dev_loss2.append(loss2.item())
+            for loss, cum in zip(losses, self.cum_losses_dev):
+                cum.append(loss.item())
             if ret_scores is not None:
                 s1, s2 = ret_scores
                 self.ret_scores_type.append(s1)
@@ -180,17 +245,16 @@ class TraningStats:
     
     def report(self, mode='trn'):
         if mode == 'trn':
-            loss1_ = sum(self.cum_trn_loss1) / len(self.cum_trn_loss1)
-            loss2_ = sum(self.cum_trn_loss2) / len(self.cum_trn_loss2)
-            self.cum_trn_loss1 = []
-            self.cum_trn_loss2 = []
+            loss_avg = (sum(l) / len(l) for l in self.cum_losses_trn)
+            self.cum_losses_trn = [[], [], []]
             msg = (
-                'Epoch {} Steps {:>5}/{} -- loss ({:.3f}, {:.3f}) lr {:.8f}'
-                ''.format(self.epoch, self.steps, self.n_exs,
-                          loss1_, loss2_, self.lr))
+                'Epoch {} Steps {:>5}/{} -- loss ({:.3f}, {:.3f}, {:.3f}) '
+                ' lr {:.8f}'.format(self.epoch, self.steps, self.n_exs,
+                                    *loss_avg, self.lr))
         elif mode == 'dev':
-            loss1_ = sum(self.cum_dev_loss1) / len(self.cum_dev_loss1)
-            loss2_ = sum(self.cum_dev_loss2) / len(self.cum_dev_loss2)
+            loss_avg = (sum(l) / len(l) for l in self.cum_losses_dev)
+            self.cum_losses_dev = [[], [], []]
+
             p1 = [s[0] for s in self.ret_scores_type]
             p1 = sum(p1) / len(p1) if len(p1) > 0 else -1
             r1 = [s[1] for s in self.ret_scores_type]
@@ -203,24 +267,19 @@ class TraningStats:
             r2 = sum(r2) / len(r2) if len(r2) > 0 else -1
             f1b = [s[2] for s in self.ret_scores_entity]
             f1b = sum(f1b) / len(f1b) if len(f1b) > 0 else -1
-
-            self.cum_dev_loss1, self.cum_dev_loss2 = [], []
             self.ret_scores_type = []
             self.ret_scores_entity = []
             msg = (
-                '[DEV] loss ({:.3f}, {:.3f}), '
+                '[DEV] loss ({:.3f}, {:.3f}, {:.3f}), '
                 'ret. (p1 {:.3f} r1 {:.3f} f1 {:.3f}) '
-                '(p2 {:.4f} r2 {:.4f} f2 {:.4f})'
-                ''.format(loss1_, loss2_, p1, r1, f1a, p2, r2, f1b)
+                '(p2 {:.6f} r2 {:.6f} f2 {:.6f})'
+                ''.format(*loss_avg, p1, r1, f1a, p2, r2, f1b)
             )
         logger.info(msg)
             
     def is_best(self):
-        if self.steps < 1000:
-            return False
-        loss1 = sum(self.cum_dev_loss1) / len(self.cum_dev_loss1)
-        loss2 = sum(self.cum_dev_loss2) / len(self.cum_dev_loss2)
-        loss = loss1 + loss2
+        loss_avg = (sum(l) / len(l) for l in self.cum_losses_dev)
+        loss = sum(loss_avg)
         if loss <= self.best_dev_loss:
             self.best_dev_loss = loss
             return True
@@ -237,7 +296,6 @@ def save_model(mdl, args, stat):
     # fname_pttn = f'{args.model_type}_*_{args.exp_id}.pt'
     # for fpath in Path(args.dir_model).glob(fname_pttn):
     #     fpath.unlink()
-    fpath = os.path.join('data/', fname)
-    if not os.path.exists(fpath):
-        torch.save(checkpoint, fpath)
-        logger.info(f'    - Saving checkpoint {fname}')
+    torch.save(checkpoint, os.path.join(args.data_dir, fname))
+    logger.info(f'Loss: {stat.best_dev_loss:.3f}, '
+                f' Saving a checkpoint {fname}')
