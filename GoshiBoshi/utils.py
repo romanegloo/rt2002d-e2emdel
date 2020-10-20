@@ -16,6 +16,8 @@ from torch.nn import functional as F
 
 from transformers import AutoModel, AutoTokenizer
 
+from GoshiBoshi.config import *
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,47 +28,6 @@ def set_seed(seed, n_gpu=0):
     if n_gpu > 0:
         torch.cuda.manual_seed_all(seed)
         
-def get_tokenizer(mdl_name):
-    if mdl_name == 'SciBERT':
-        return AutoTokenizer.from_pretrained('allenai/scibert_scivocab_cased')
-
-def get_bert_model(mdl_name):
-    if mdl_name == 'SciBERT':
-        return AutoModel.from_pretrained('allenai/scibert_scivocab_cased')
-
-def csv_to_ner_split_examples(args, split_ranges=[0., .8, .9]):
-    examples = []
-    if args.dataset == 'KaggleNER':
-        """
-        Kaggle NER Example:
-        Sentence # | Word | POS | Tag
-        Sentence: 1 | Thousands | NNS | O
-                    | of | IN | O
-        """
-        with open(args.ds_kaggle_path, encoding='latin1') as f:
-            next(f)
-            reader = csv.reader(f)
-            sent_len = 0
-            for l in reader:
-                if l[0] != '':
-                    sent_len = len(l[1]) + 1
-                    examples.append(([l[1]], [l[2]], [l[3]]))
-                else:
-                    sent_len += len(l[1]) + 1
-                    if sent_len >= args.max_sent_len:
-                        continue
-                    examples[-1][0].append(l[1])
-                    examples[-1][1].append(l[2])
-                    examples[-1][2].append(l[3])
-        random.shuffle(examples)
-        n_exs = len(examples)
-        sr = split_ranges + [1.]
-
-        return (
-            examples[int(sr[i] * n_exs) : int(sr[i+1] * n_exs)]
-            for i in range(len(sr)-1)
-        )
-
 def sequence_mask(lengths, max_len=None):
     """
     Creates a boolean mask from sequence lengths.
@@ -80,39 +41,7 @@ def sequence_mask(lengths, max_len=None):
             .repeat(batch_size, 1)
             .lt(lengths.unsqueeze(1)))
 
-# def compute_loss(logits, y0, y1, y2, norm_space):
-#     out_tag, out_type, out_ent = (out.to('cpu') for out in logits)
-#     N, L, C1 = out_type.size()
-#     # marker_idx = torch.tensor([i for i in range(L-1) if i%2!=0])
-#     # out_type = out_type.index_select(1, marker_idx)
-#     # out_ent = out_ent.index_select(1, marker_idx)
-
-#     # Log likelihood
-#     log_probs_tag = F.log_softmax(out_tag, dim=-1)
-#     log_probs_type = F.log_softmax(out_type, dim=-1)
-#     out_ent = torch.cat((log_probs_type[:,:,:-1], out_ent), dim=-1)
-#     norm_scores = torch.matmul(out_ent, norm_space.T)
-#     log_probs_name = F.log_softmax(norm_scores, dim=-1)
-
-#     rho = 0.1
-#     # NLLLoss of tags
-#     loss0 = -(log_probs_tag[:,1:-1,1] * y0.long()[:,:,1]).sum() * rho
-#     loss0 += -(log_probs_tag[:,1:-1,[0,2]] * y1.long()[:,:,[0,2]]).sum() * (1-rho) 
-#     loss0 /= y1.sum()
-
-#     # NLLLoss of entity types
-#     loss1 = -(log_probs_type[:,1:-1,-1] * y1.long()[:,:,-1]).sum() * rho
-#     loss1 += -(log_probs_type[:,1:-1,:-1] * y1.long()[:,:,:-1]).sum() * (1-rho)
-#     loss1 /= y1.sum()
-
-#     # NLLLoss of entity names 
-#     loss2 = -(log_probs_name[:,1:-1,-1] * y2.long()[:,:,-1]).sum() * rho
-#     loss2 += -(log_probs_name[:,1:-1,:-1] * y2.long()[:,:,:-1]).sum() * (1-rho)
-#     loss2 /= y1.sum()
-
-#     return loss0, loss1, loss2
-
-def compute_retrieval_scores(logits, x_mask, y1, y2, name_norm):
+def compute_retrieval_scores(logits, x_mask, y1, y2, name_space):
     """
     measure micro retrieval performance
     
@@ -120,7 +49,8 @@ def compute_retrieval_scores(logits, x_mask, y1, y2, name_norm):
     recall: the percentage of entities present in the corpus that are found
             by the model
     """
-    out_tag, out_type, out_ent = (out[:,1:-1,:].to('cpu') for out in logits)
+    out_iob, out_st, out_name = \
+        (out[:,1:-1,:].to('cpu') if out is not None else None for out in logits)
     x_mask = x_mask[:,1:-1]
     # marker_idx = torch.tensor([i for i in range(L-1) if i%2!=0])
     # out_type = out_type.index_select(1, marker_idx)
@@ -130,11 +60,14 @@ def compute_retrieval_scores(logits, x_mask, y1, y2, name_norm):
 
     scores = []
     epsilon = 1e-7
-    logprobs_type = F.log_softmax(out_type, dim=-1)
-    for (out, y, norm) in ((out_type, y1, None),
-                           (out_ent, y2, name_norm)):
+    logprobs_st = F.log_softmax(out_st, dim=-1)
+    for (out, y, norm) in ((out_st, y1, None),
+                           (out_name, y2, name_space)):
         if norm is not None:
-            out = torch.cat((logprobs_type[:,:,:-1], out_ent), dim=-1)
+            x = logprobs_st[:,:,:-1]
+            if out_iob is None:  # For the one-tag model
+                x = x.reshape(*(x.size()[:-1]), len(MM_ST), 2).sum(axis=-1)
+            out = torch.cat((x, out_name), dim=-1)
             norm_scores = torch.matmul(out, norm.T)
             pred = norm_scores.argmax(dim=-1)
         else:
@@ -156,18 +89,47 @@ def compute_retrieval_scores(logits, x_mask, y1, y2, name_norm):
 
     return scores
 
+
 def infer_ret(logits, x_mask, annotations, name_space, types, names):
-    logits_tag, logits_type, prj_name = (t[:,1:-1,:] for t in logits)
-    dev = logits_tag.device
+    out_iob, out_st, out_name = (out[:,1:-1,:] if out is not None else None
+                                    for out in logits)
+    if logits[2].size(1) != logits[1].size(1):
+        out_iob = logits[2]
+
+    # if logits[0].size(1) != logits[1].size(1):
+    #     logits_tag = logits[0]
+    # else:
+    #     logits_tag = logits[0][:,1:-1,:]
+
+    dev = out_st.device
     name_space = name_space.to(dev)
 
-    logits_tag = logits_tag.argmax(dim=-1)
+    # out_st.shape = [N, L, (2T+1)]
+    if out_iob is None:
+        pred_tag = out_st.argmax(dim=-1)
+        pred_tag[pred_tag == out_st.size(-1)-1] = -1
+        pred_tag[torch.logical_and(pred_tag >= 0, pred_tag%2 == 0)] = 2
+        pred_tag[torch.logical_and(pred_tag >= 0, pred_tag%2 == 1)] = 0
+        pred_tag[pred_tag==-1] = 1
+    else:
+        pred_tag = out_iob.argmax(dim=-1)
 
-    logprobs_type = F.log_softmax(logits_type, dim=-1)
-    logits_type = logits_type.argmax(dim=-1)
+    # logits_tag = logits_tag.argmax(dim=-1)
 
-    prj_name = torch.cat((logprobs_type[:,:,:-1], prj_name), dim=-1)
-    name_scores = torch.matmul(prj_name, name_space.T)
+    if out_iob is None:
+        probs = F.softmax(out_st, dim=-1)
+        x = probs[:,:,:-1]
+        probs_type = x.reshape(*(x.size()[:-1]), len(MM_ST), 2).sum(axis=-1)
+        logprobs_st = torch.log(
+            torch.cat((probs_type, probs[:, :, -1].unsqueeze(-1)), dim=-1)
+        )
+        pred_st = logprobs_st.argmax(dim=-1)
+    else:
+        logprobs_st = F.log_softmax(out_st, dim=-1)
+        pred_st = out_st.argmax(dim=-1)
+
+    out_name = torch.cat((logprobs_st[:,:,:-1], out_name), dim=-1)
+    name_scores = torch.matmul(out_name, name_space.T)
     name_scores = name_scores.argmax(dim=-1)
 
     annt_dict = dict()
@@ -177,11 +139,11 @@ def infer_ret(logits, x_mask, annotations, name_space, types, names):
 
     pred_dict = dict()
     mention = None
-    for i, ex in enumerate(logits_tag):
+    for i, ex in enumerate(pred_tag):
         for j, idx in enumerate(ex):
             if j == x_mask[i].sum():
                 break
-            ti = logits_type[i,j].item()
+            ti = pred_st[i,j].item()
             ei = name_scores[i,j].item()
             if idx == 0:  # I
                 if mention is not None:
@@ -234,10 +196,12 @@ class TraningStats:
         if mode == 'trn':
             self.steps += 1
             for loss, cum in zip(losses, self.cum_losses_trn):
-                cum.append(loss.item())
+                if loss is not None:
+                    cum.append(loss.item())
         else:
             for loss, cum in zip(losses, self.cum_losses_dev):
-                cum.append(loss.item())
+                if loss is not None:
+                    cum.append(loss.item())
             if ret_scores is not None:
                 s1, s2 = ret_scores
                 self.ret_scores_type.append(s1)
@@ -245,14 +209,16 @@ class TraningStats:
     
     def report(self, mode='trn'):
         if mode == 'trn':
-            loss_avg = (sum(l) / len(l) for l in self.cum_losses_trn)
+            loss_avg = (sum(l) / len(l) if len(l) > 0 else 0
+                        for l in self.cum_losses_trn)
             self.cum_losses_trn = [[], [], []]
             msg = (
                 'Epoch {} Steps {:>5}/{} -- loss ({:.3f}, {:.3f}, {:.3f}) '
                 ' lr {:.8f}'.format(self.epoch, self.steps, self.n_exs,
                                     *loss_avg, self.lr))
         elif mode == 'dev':
-            loss_avg = (sum(l) / len(l) for l in self.cum_losses_dev)
+            loss_avg = (sum(l) / len(l) if len(l) > 0 else 0
+                        for l in self.cum_losses_dev)
             self.cum_losses_dev = [[], [], []]
 
             p1 = [s[0] for s in self.ret_scores_type]
@@ -278,7 +244,8 @@ class TraningStats:
         logger.info(msg)
             
     def is_best(self):
-        loss_avg = (sum(l) / len(l) for l in self.cum_losses_dev)
+        loss_avg = (sum(l) / len(l) if len(l) > 0 else 0
+                    for l in self.cum_losses_dev)
         loss = sum(loss_avg)
         if loss <= self.best_dev_loss:
             self.best_dev_loss = loss

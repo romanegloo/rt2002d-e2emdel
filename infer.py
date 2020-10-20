@@ -15,11 +15,10 @@ import torch
 # from torch import nn
 from torch.utils.data import DataLoader
 
-from GoshiBoshi.data import KaggleNERDataset, MedMentionDataset, batchify
-from GoshiBoshi.model import JointMDEL
+from GoshiBoshi.config import MM_ST
+from GoshiBoshi.data import MedMentionDataset, batchify
+from GoshiBoshi.model import JointMDEL_L, JointMDEL_H, JointMDEL_OT
 import GoshiBoshi.utils as utils
-
-# from transformers import AdamW, get_linear_schedule_with_warmup
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +44,7 @@ parser.add_argument('--random_seed', type=int, default=12345,
 # Model configuration
 parser.add_argument('--batch_size', type=int, default=8,
                     help='Number of examples in running train/valid steps')
-parser.add_argument('--max_sent_len', type=int, default=168,
+parser.add_argument('--max_sent_len', type=int, default=196,
                     help='Maximum sequence length')
 args = parser.parse_args()
 
@@ -76,11 +75,17 @@ mode = 'tst'
 exs = pickle.load(open(args.ds_medmention_path, 'rb'))
 ds = MedMentionDataset(exs, mode, max_sent_len=args.max_sent_len)
 
+checkpoint = torch.load(os.path.join(args.data_dir, args.best_mdl_file))
+args_saved = checkpoint['args']
 
 # Load a saved model
-model = JointMDEL(args, num_types=len(exs['typeIDs']))
+if args_saved.model_name == 'tag-lo':
+    model = JointMDEL_L(device=args.device)
+elif args_saved.model_name == 'tag-hi':
+    model = JointMDEL_H(device=args.device)
+elif args_saved.model_name == 'one-tag':
+    model = JointMDEL_OT(device=args.device)
 model.to(args.device)
-checkpoint = torch.load(os.path.join(args.data_dir, args.best_mdl_file))
 model.load_state_dict(checkpoint['model'])
 norm_space = torch.cat((exs['entity_names'],
                         torch.zeros(exs['entity_names'].size(-1)).unsqueeze(0)))

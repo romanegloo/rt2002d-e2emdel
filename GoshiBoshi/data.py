@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
+from GoshiBoshi.config import *
 import GoshiBoshi.utils as utils
 
 
@@ -21,12 +22,17 @@ logger = logging.getLogger(__name__)
 
 class MedMentionDataset(Dataset):
 
-    def __init__(self, exs, mode, max_sent_len=160):
+    def __init__(self, exs, mode, max_sent_len=160, one_tag=False):
         self.mode = mode
         self.examples = [rec for rec in exs['examples'] if rec['ds'] == mode]
+        self.one_tag = one_tag
         self.tags = 'IOB'
         self.tag2idx = {t: i for i, t in enumerate(self.tags)}
-        self.types = exs['typeIDs'] + ['N']  # 'N' for no class
+        if not one_tag:
+            self.types = MM_ST + ['N']  # N for 'N'ull class
+        else:
+            self.types = [MM_ST[int(i/2)]+'-B' if i%2==0 else MM_ST[int(i/2)]+'-I'
+                         for i in range(2*len(MM_ST))] + ['N']
         self.type2idx = {k: i for (i, k) in enumerate(self.types)}
         self.names = exs['ni2cui'] + ['N']
         self.cui2idx = defaultdict(list)
@@ -79,13 +85,19 @@ class MedMentionDataset(Dataset):
         for (bi, l, m, typeid, entid) in ex['annotations']:
             if bi+l-1 >= self.max_sent_len:
                 continue
-            t = self.type2idx[typeid]
+            if not self.one_tag:
+                t = self.type2idx[typeid]
+            else:
+                t = self.type2idx[typeid+'-B']
             cui = entid[5:]
             if cui not in self.cui2idx:
                 self.not_found.add(cui)
             e = self.cui2idx[cui]
             y0[bi, g_b], y0[bi+1:bi+l, g_i], y0[bi:bi+l, g_o] = True, True, False
-            y1[bi:bi+l, t], y1[bi:bi+l, t_n]= True, False
+            if not self.one_tag:
+                y1[bi:bi+l, t], y1[bi:bi+l, t_n]= True, False
+            else:
+                y1[bi, t], y1[bi+1:bi+l, t+1], y1[bi:bi+l, t_n] = True, True, False
             y2[bi:bi+l, e], y2[bi:bi+l, e_n] = True, False
         
         return x, src_len, y0, y1, y2
@@ -117,72 +129,3 @@ def batchify(batch):
         y2_mask[i,:y_lens[i],:] = ex[4]
 
     return x, segs, x_mask, y0_mask, y1_mask, y2_mask
-
-
-class KaggleNERDataset(Dataset):
-    lbl2idx = {k: i for i, k in enumerate(
-        ['O', 'B-org', 'I-org', 'B-per', 'I-per', 'B-geo', 'I-geo',
-         'B-tim', 'I-tim', 'B-art', 'I-art', 'B-gpe', 'I-gpe', 'B-eve', 'I-eve',
-         'B-nat', 'I-nat']
-    )}
-    def __init__(self, examples, tokenizer):
-        self.examples = examples
-        self.tokenizer = tokenizer
-
-    def __len__(self):
-        return(len(self.examples))
-    
-    def __getitem__(self, idx):
-        words, _, tags = self.examples[idx]
-        sw_ids, token_start_idxs = self.subword_tokenize_to_ids(words)
-        y = []
-        tag_idx = 0
-        for i, sw_id in enumerate(sw_ids):
-            if sw_id in self.tokenizer.all_special_ids:
-                y.append(self.lbl2idx['O'])
-            elif i not in token_start_idxs:
-                y.append(y[-1])
-            else:
-                y.append(self.lbl2idx[tags[tag_idx]])
-                tag_idx += 1
-        assert len(sw_ids) == len(y)
-        
-        return sw_ids, y
-    
-    def subword_tokenize(self, tokens):
-        """Huggingface default tokenizer does not provide token boundaries which
-        makes it difficult to align features on tokenized subwords. 
-        `subword_tokenize` and `subword_tokenize_to_ids` provided sequence of
-        subword indices along with its original token boundaries
-
-        Parameters
-            tokens: List of str
-        
-        Returns
-            - List of subwords, flanked by the special symboles for BERT
-            - List of indices of the tokenized subwords
-        """
-        tkn = self.tokenizer
-        subwords = [tkn.tokenize(t) for t in tokens]
-        subword_lengths = [len(seg) for seg in subwords]
-        # Flatten subwords list and flank with BERT special tokens
-        subwords = [tkn.cls_token] + \
-            [subword for sublist in subwords for subword in sublist] + \
-            [tkn.sep_token]
-        token_start_idxs = [0] + list(accumulate(subword_lengths[:-1]))
-        token_start_idxs = [1+l for l in token_start_idxs]
-        return subwords, token_start_idxs
-
-    def subword_tokenize_to_ids(self, tokens):
-        """Converts subwords to ids after applying `subword_tokenize`
-        
-        Parameters
-            Tokens: List of str
-        
-        Returns
-            - List of subword IDs
-            - A mask indiciating padding tokens
-        """
-        subwords, token_start_idxs = self.subword_tokenize(tokens)
-        subword_ids = self.tokenizer.convert_tokens_to_ids(subwords)
-        return subword_ids, token_start_idxs

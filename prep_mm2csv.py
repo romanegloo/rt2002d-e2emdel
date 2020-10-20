@@ -31,7 +31,7 @@ UMLS MRCONSO example:
 (CUI|LAT|TS|LUI|STT|SUI|ISPREF|AUI|SAUI|SCUI|SAB|TTY|CODE|STRING|SRL|SUPPRESS|CVF)
 C0000005|ENG|P|L0000005|PF|S0007492|Y|A26634265||M0019694|D012711|MSH|PEP|D012711|(131)I-Macroaggregated Albumin|0|N|256|
 """
-from typing import List, DefaultDict, Dict, Set, Tuple
+from typing import List, Dict, Set, Tuple
 import gzip
 import re
 import logging
@@ -49,31 +49,21 @@ from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer, AutoModel
 
 import GoshiBoshi.utils as utils
+from GoshiBoshi.config import *
 
 
-MM_FILE = 'data/MedMentions/corpus_pubtator.txt.gz'
-MM_pmids_trn = 'data/MedMentions/corpus_pubtator_pmids_trng.txt'
-MM_pmids_dev = 'data/MedMentions/corpus_pubtator_pmids_dev.txt'
-MM_pmids_tst = 'data/MedMentions/corpus_pubtator_pmids_test.txt'
-MRCONSO_FILE = 'data/UMLS/MRCONSO.RRF'
-MRSTY_FILE = 'data/UMLS/MRSTY.RRF'
-SRSTRE_FILE = 'data/UMLS/SRSTRE1'
 MM_OUT_FILE = 'data/MedMentions/mm.pkl'
-BERT_MDL_DIM = 768
+ST_MAP = {t: t for t in MM_ST}
 
-TYPE_ROOTS = [f'T{t:03}' for t in 
-              [5, 7, 17, 22, 31, 33, 37, 38, 58, 62, 74, 82, 91, 92,
-               97, 98, 103, 168, 170, 201, 204]]
-ST_MAP = {t: t for t in TYPE_ROOTS}
-# Read hierarchical relationships between UMLS semantic types
+# Read hierarchical relationships between UMLS semantic types, and expand ST_MAP
 with open(SRSTRE_FILE) as f:
     while True:
         len_all = len(ST_MAP)
         for line in f:
             st1, r, st2, _ = line.split('|')
-            if st2 in ST_MAP and r == 'T186':
+            if st2 in ST_MAP and r == 'T186':  # 'is-a' relationship
                 ST_MAP[st1] = ST_MAP[st2]
-        if len(ST_MAP) != len_all:
+        if len(ST_MAP) != len_all:  # Repeat
             f.seek(0)
         else:
             break
@@ -227,21 +217,24 @@ if __name__ == '__main__':
         datefmt='%b%d %H:%M'
     )
 
-    # Read from the MedMention datafile
     # Load BERT tokenizer
-    tokenizer = AutoTokenizer.from_pretrained('allenai/scibert_scivocab_cased')
+    tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL)
+
+    # Set defaults
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
 
     data = dict.fromkeys(['examples', 'typeIDs', 'bert_special_tokens_map'])
     data['examples'] = []
     data['bert_special_tokens_map'] = dict(zip(tokenizer.all_special_tokens,
                                                tokenizer.all_special_ids))
-    data['typeIDs'] = TYPE_ROOTS
     data['ontology_abbr'] = ['CPT', 'FMA', 'GO', 'HGNC', 'HPO', 'ICD10',
                             'ICD10CM', 'ICD9CM', 'MDR', 'MSH', 'MTH', 'NCBI',
                             'NCI', 'NDDF', 'NDFRT', 'OMIM', 'RXNORM',
                             'SNOMEDCT_US']
-        # Types are defined [here](https://tinyurl.com/y49oovcw)
-
+        # MM Semantic types are defined here: https://tinyurl.com/y49oovcw
 
     # Read MedMention datafile; get concepts with examples
     a_doc: List[str] = []
@@ -264,7 +257,7 @@ if __name__ == '__main__':
     pbar.close()
     logger.info(f'{len(concept_counter)} unique concepts found in the examples' )
 
-    # For each example, assign dataset mode [trn/dev/tst] according to the
+    # For each example, assign dataset mode {trn, dev, tst} specified as in the
     # original split (https://tinyurl.com/y2yujq2o)
     pmids_trn = [pmid.rstrip() for pmid in open(MM_pmids_trn).readlines()]
     pmids_dev = [pmid.rstrip() for pmid in open(MM_pmids_dev).readlines()]
@@ -279,7 +272,7 @@ if __name__ == '__main__':
         else:
             logger.warning('pmid {} does not exist in any of the datsets')
 
-    # Read the UMLS concepts that belong to st21pv semantic types
+    # Construct a dict that maps the MM_st21pv CUIs to their semantic types
     st21pv_cuis = dict()
     with open(MRSTY_FILE) as f:
         for line in f:
@@ -290,20 +283,15 @@ if __name__ == '__main__':
                 ''.format(len(st21pv_cuis)))
     
     logger.info('Loading SciBERT model...')
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-    else:
-        device = torch.device('cpu')
-    mdl = AutoModel.from_pretrained('allenai/scibert_scivocab_cased', 
-                                    output_hidden_states=True)
+    mdl = AutoModel.from_pretrained(BERT_MODEL, output_hidden_states=True)
     mdl.to(device)
     mdl.eval()
 
     # Read the UMLS concepts and build the name normalization vectors.
     # MM-ST21pv contains 3,170,502 concepts. 
-    norm_dim = BERT_MDL_DIM + len(data['typeIDs'])
-    # norm_space = torch.empty((3500000, norm_dim))
-    norm_space_s = torch.empty((5*len(concept_counter), norm_dim))
+    norm_dim = len(MM_ST) + BERT_MODEL_DIM
+    # norm = torch.empty((3500000, norm_dim))
+    norm_s = torch.zeros((5*len(concept_counter), norm_dim))
     ni2cui: List[str] = []
     ni2cui_s: List[str] = []
     
@@ -336,12 +324,12 @@ if __name__ == '__main__':
                     utils.sequence_mask(inp_lengths, inputs.size(1)).to(device)
                 _, _, output = mdl(inputs, attention_mask=masks)
                 name_embs = get_name_embeddings(output[-2], entity_types,
-                                                data['typeIDs'], inp_lengths)
+                                                MM_ST, inp_lengths)
 
-                # norm_space[cnt-bsz:cnt] = name_embs
+                # norm[cnt-bsz:cnt] = name_embs
                 for (i, cui) in enumerate(ni2cui[-bsz:]):
                     if f'UMLS:{cui}' in concept_counter:
-                        norm_space_s[cnt_s] = name_embs[i]
+                        norm_s[cnt_s] = name_embs[i]
                         ni2cui_s.append(cui)
                         cnt_s += 1
                 batch = []
@@ -355,11 +343,11 @@ if __name__ == '__main__':
             masks = utils.sequence_mask(inp_lengths, inputs.size(1)).to(device)
             _, _, output = mdl(inputs, attention_mask=masks)
             name_embs = get_name_embeddings(output[-2], entity_types,
-                                            data['typeIDs'], inp_lengths)
-            # norm_space[cnt-len(batch):cnt] = name_embs
+                                            MM_ST, inp_lengths)
+            # norm[cnt-len(batch):cnt] = name_embs
             for (i, cui) in enumerate(ni2cui[-len(batch):]):
                 if f'UMLS:{cui}' in concept_counter:
-                    norm_space_s[cnt_s] = name_embs[i]
+                    norm_s[cnt_s] = name_embs[i]
                     ni2cui_s.append(cui)
                     # cui2ni_s[cui].append(cnt_s)
                     cnt_s += 1
@@ -367,8 +355,8 @@ if __name__ == '__main__':
     pbar.close()
     logger.info(f'UMLS concept definitions (total: {len(ni2cui)}'
                 f' sub: {len(ni2cui_s)}) found')
-    # norm_space = norm_space[:cnt]
-    data['entity_names'] = norm_space_s[:cnt_s]
+    # norm = norm[:cnt]
+    data['entity_names'] = norm_s[:cnt_s]
     data['ni2cui'] = ni2cui_s
 
     # Saving processed examples
