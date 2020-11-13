@@ -19,10 +19,11 @@ class FocalLoss(nn.Module):
 
     def forward(self, logits, y0, y1, y2, name_space):
         # Don't need starting and ending special tokens
-        out_iob, out_st, out_name = (out[:,1:-1,:] if out is not None else None
-                                     for out in logits)
-        if logits[2].size(1) != logits[1].size(1):
-            out_iob = logits[2]
+        out_iob, out_st, c_emb = \
+            (out[:,1:-1,:] if out is not None else None for out in logits)
+        # if logits[0] is not None and \
+        #         logits[0].size(1) != logits[1].size(1):  # tag-hi model
+        #     out_iob = logits[0]
 
         dev = out_st.device
         y0 = y0.to(dev)
@@ -42,7 +43,7 @@ class FocalLoss(nn.Module):
             )
             pt = torch.exp(-ce)
             loss0 = (self.alpha * (1-pt)**self.gamma * ce).mean()
-        
+
         # Loss1: Types
         logprobs_st = F.log_softmax(out_st, dim=-1)
         ce = F.cross_entropy(
@@ -58,8 +59,7 @@ class FocalLoss(nn.Module):
         if out_iob is None:  # For the one-tag model
             pred_st = pred_st.reshape(*(pred_st.size()[:-1]),
                                     len(MM_ST), 2).sum(axis=-1)
-        name = torch.cat((pred_st, out_name), dim=-1)
-        norm_scores = torch.matmul(name, name_space.T)
+        norm_scores = torch.matmul(c_emb, name_space.T)
         logprobs_name = F.log_softmax(norm_scores, dim=-1)
         ce = F.cross_entropy(
             logprobs_name.view(-1, logprobs_name.size(-1)),

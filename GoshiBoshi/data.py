@@ -15,6 +15,7 @@ from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
 from GoshiBoshi.config import *
+import GoshiBoshi.config as cfg
 import GoshiBoshi.utils as utils
 
 
@@ -22,9 +23,24 @@ logger = logging.getLogger(__name__)
 
 class MedMentionDataset(Dataset):
 
-    def __init__(self, exs, mode, max_sent_len=160, one_tag=False):
+    def __init__(self, exs, mode, ni2cui, special_tokens=None,
+                 max_sent_len=196, one_tag=False):
+        """
+        MedMentions dataset class
+
+        Args:
+            exs (tuple): Sentence-level annotation examples
+            mode (str): Running mode {'trn', 'val', 'tst'}
+            name_mapping (list): ni2cui (name index to CUI), i.e., list of CUIs
+            special_tokens (list, optional): Mapping of the BERT special
+                tokens. Defaults to None.
+            max_sent_len (int, optional): Maximum length of input sentnece.
+                Defaults to 196.
+            one_tag (bool, optional): Flag indicating if the model is one-tag.
+                Defaults to False.
+        """
         self.mode = mode
-        self.examples = [rec for rec in exs['examples'] if rec['ds'] == mode]
+        self.examples = [rec for rec in exs if rec['ds'] == mode]
         self.one_tag = one_tag
         self.tags = 'IOB'
         self.tag2idx = {t: i for i, t in enumerate(self.tags)}
@@ -34,12 +50,15 @@ class MedMentionDataset(Dataset):
             self.types = [MM_ST[int(i/2)]+'-B' if i%2==0 else MM_ST[int(i/2)]+'-I'
                          for i in range(2*len(MM_ST))] + ['N']
         self.type2idx = {k: i for (i, k) in enumerate(self.types)}
-        self.names = exs['ni2cui'] + ['N']
+        self.ni2cui = ni2cui + ['N']
         self.cui2idx = defaultdict(list)
-        self.cui2idx['N'] = [len(exs['ni2cui'])]
-        for i, cui in enumerate(exs['ni2cui']):
+        for i, cui in enumerate(ni2cui):
             self.cui2idx[cui].append(i)
-        self.bert_special_tokens = exs['bert_special_tokens_map']
+        self.cui2idx['N'] = [len(ni2cui)]
+        if special_tokens is None:
+            self.bert_special_tokens = cfg.BERT_SPECIAL_TOKENS
+        else:
+            self.bert_special_tokens = special_tokens
         self.max_sent_len = max_sent_len
         self.not_found = set()
 
@@ -58,8 +77,8 @@ class MedMentionDataset(Dataset):
         # x = torch.tensor([self.bert_special_tokens['[MASK]'], 0]).repeat(src_len)
         # for i, v in enumerate(ex['token_ids'][:self.max_sent_len]):
         #     x[2*i+1] = v
-        x = torch.tensor([self.bert_special_tokens['[CLS]']] + 
-                         ex['token_ids'][:self.max_sent_len] + 
+        x = torch.tensor([self.bert_special_tokens['[CLS]']] +
+                         ex['token_ids'][:self.max_sent_len] +
                          [self.bert_special_tokens['[SEP]']])
         if self.mode == 'tst':
             return x, src_len, ex['annotations']
@@ -78,7 +97,7 @@ class MedMentionDataset(Dataset):
         y1 = y1.repeat(src_len, 1)
 
         # Entity name labels
-        y2 = torch.zeros(len(self.names), dtype=torch.bool)
+        y2 = torch.zeros(len(self.ni2cui), dtype=torch.bool)
         y2[e_n] = True
         y2 = y2.repeat(src_len, 1)
 
@@ -99,9 +118,9 @@ class MedMentionDataset(Dataset):
             else:
                 y1[bi, t], y1[bi+1:bi+l, t+1], y1[bi:bi+l, t_n] = True, True, False
             y2[bi:bi+l, e], y2[bi:bi+l, e_n] = True, False
-        
+
         return x, src_len, y0, y1, y2
-            
+
 
 
 def batchify(batch):

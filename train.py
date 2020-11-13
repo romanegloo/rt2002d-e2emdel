@@ -16,10 +16,10 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from transformers import AdamW, get_linear_schedule_with_warmup
+from transformers import AdamW
 from transformers import AutoTokenizer
 
-from GoshiBoshi.config import MM_ST, BERT_MODEL
+import GoshiBoshi.config as cfg
 from GoshiBoshi.data import MedMentionDataset, batchify
 from GoshiBoshi.model import JointMDEL_L, JointMDEL_H, JointMDEL_OT
 import GoshiBoshi.utils as utils
@@ -40,18 +40,17 @@ def train(args, ds, mdl, crit, optim, sch, name_norm, stats):
         inputs, segs, x_mask, y0, y1, y2 = batch
         optim.zero_grad()
         out = mdl(inputs, segs, x_mask)
-        l, l0, l1, l2 = crit(out, y0, y1, y2, name_norm) 
+        l, l0, l1, l2 = crit(out, y0, y1, y2, name_norm)
         l.backward()
         optim.step()
         nn.utils.clip_grad_norm_(mdl.parameters(), 10)
         sch.step()
-        stats.update((l0, l1, l2))
+        stats.update_trn((l0, l1, l2))
 
         # Update stats
         if stats.steps % args.log_interval == 0:
             stats.lr = optim.param_groups[0]['lr']
-            stats.report()
-            # print(ds['trn'].not_found)
+            stats.report_trn()
         if stats.steps % args.eval_interval == 0:
             dev_eval(args, ds, mdl, crit, name_norm, stats)
 
@@ -66,22 +65,14 @@ def dev_eval(args, ds, mdl, crit, name_norm, stats):
             inputs, segs, x_mask, y0, y1, y2 = batch
             out = mdl(inputs, segs, x_mask)
             l, l0, l1, l2 = crit(out, y0, y1, y2, name_norm)
-            ret_scores = \
-                utils.compute_retrieval_scores(out, x_mask, y1, y2, name_norm)
-            if i == 0:  # debug
-                _, pred, _ = out
-                x_len = x_mask[0].sum()
-                print(y1.long().argmax(dim=-1)[0][:x_len])
-                print(pred[:,1:-1,:].argmax(dim=-1)[0][:x_len])
-            stats.update((l0, l1, l2), ret_scores=ret_scores, mode='dev')
-            if i >= 200:
+            ret_out = utils.retrieval_outcomes(out, batch, name_norm)
+            stats.update_dev((l0, l1, l2), ret_out)
+            if i >= 300:
                 break
-    if stats.is_best():
+    stats.report_dev()
+    if stats.is_best:
         utils.save_model(mdl, args, stats)
 
-    stats.report(mode='dev')
-    mdl.train()
-            
 
 if __name__ == '__main__':
     # Configuration -----------------------------------------------------------
@@ -89,35 +80,27 @@ if __name__ == '__main__':
         'Joint Mention Dection and Entity Linking to complete PubTator',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    # Paths
-    parser.add_argument('--data_dir', type=str,
-                        default='data/', help='Data dicretory')
-    parser.add_argument('--ds_medmention_path', type=str,
-                        default='data/MedMentions/mm.pkl',
-                        help='Path to the preprocessed MedMention data file')
-
-    # Runtime
-    parser.add_argument('--random_seed', type=int, default=12345,
-                        help='Random seed')
 
     # Model configuration
-    parser.add_argument('--model_name', type=str, default='tag-lo',
-                choices=['one-tag', 'tag-lo', 'tag-hi'],
-                help=('Select different model architecture. ('
-                        'one-tag: IOB as in part of named entity classes, '
-                        'tag-lo: seperate classifier for IOB chunking, '
-                        'tag-hi: chunking classifier on top of the model)'))
-    parser.add_argument('--lr', type=float, default=3e-5,
-                        help='Default learning rate')
-    parser.add_argument('--num_warmup_steps', type=int, default=0,
-                        help='Number of steps for warmup in optimize schedule')
-    parser.add_argument('--num_training_steps', type=int, default=0,
-                        help='Number of steps for training')
-    parser.add_argument('--batch_size', type=int, default=8,
-                        help='Number of examples in running train/valid steps')
-    parser.add_argument('--max_sent_len', type=int, default=196,
+    parser.add_argument('--model_name', type=str, default=cfg.MDL_NAME,
+                        choices=['one-tag', 'tag-lo', 'tag-hi'],
+                        help='Different models with varying IOB tagging positions')
+    parser.add_argument('--batch_size', type=int, default=cfg.BSZ,
+                        help='Number of examples in train/valid runs')
+    parser.add_argument('--max_sent_len', type=int, default=cfg.MAX_SENT_LEN,
                         help='Maximum sequence length')
-                        
+
+    # Optimization
+    parser.add_argument('--lr', type=float, default=cfg.LR,
+                        help='Default learning rate')
+    parser.add_argument('--scheduler', type=str, default='linear',
+                        choices=['linear', 'cyclic_cosine', 'plateau'],
+                        help='Learning rate scheduler')
+    parser.add_argument('--focal_alpha', type=float, default=0.25,
+                        help='Focal loss parameter, alpha')
+    parser.add_argument('--focal_gamma', type=float, default=2.,
+                        help='Focal loss parameter, gamma')
+
     # Runtime environmnet
     parser.add_argument('--epochs', type=int, default=3,
                         help='Number of epochs to train')
@@ -138,7 +121,7 @@ if __name__ == '__main__':
     )
 
     # Set random seed
-    utils.set_seed(args.random_seed)
+    utils.set_seed(cfg.RND_SEED)
 
     # GPU
     if torch.cuda.is_available():
@@ -148,40 +131,55 @@ if __name__ == '__main__':
         args.device = torch.device('cpu')
         logger.info('Running on CPUs')
 
-    # Read a tokenizer (vocab is defined in the tokenizer)
-    tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL)
+    # Load a pretrained tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(cfg.BERT_MODEL)
 
     # Read a dataset
-    exs = pickle.load(open(args.ds_medmention_path, 'rb'))
-    ds = {mode: MedMentionDataset(exs, mode, 
+    exs = pickle.load(open(cfg.MM_DS_FILE, 'rb'))
+    special_tokens = dict(zip(tokenizer.all_special_tokens,
+                              tokenizer.all_special_ids))
+    ds = {mode: MedMentionDataset(exs['examples'], mode, exs['ni2cui'],
+                                  special_tokens=exs['bert_special_tokens_map'],
                                   max_sent_len=args.max_sent_len,
                                   one_tag=(args.model_name=='one-tag'))
           for mode in ['trn', 'dev']}
 
-    if args.num_training_steps == 0:
-        args.num_training_steps = \
-            int(len(ds['trn']) / args.batch_size) * args.epochs
-    if args.num_warmup_steps == 0:
-        args.num_warmup_steps = int(args.num_training_steps * .05)
+    # Default values for optimization
+    args.num_training_steps = int(len(ds['trn']) / args.batch_size) * args.epochs
+    args.num_warmup_steps = int(args.num_training_steps * .05)
+
 
     # Model
     if args.model_name == 'one-tag':
-        model = JointMDEL_OT(device=args.device)
+        model = JointMDEL_OT(args)
     if args.model_name == 'tag-lo':
-        model = JointMDEL_L(device=args.device)
+        model = JointMDEL_L(args)
     elif args.model_name == 'tag-hi':
-        model = JointMDEL_H(device=args.device)
+        model = JointMDEL_H(args)
 
     model.to(args.device)
-    criterion = FocalLoss()
+    criterion = FocalLoss(alpha=args.focal_alpha, gamma=args.focal_gamma)
     optimizer = AdamW(model.parameters(), lr=float(args.lr))
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        args.num_warmup_steps,
-        args.num_training_steps
-    )
-    norm_space = torch.cat((exs['entity_names'],
-                            torch.zeros(exs['entity_names'].size(-1)).unsqueeze(0)))
+    if args.scheduler == 'linear':
+        from transformers import get_linear_schedule_with_warmup
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            args.num_warmup_steps,
+            args.num_training_steps
+        )
+    elif args.scheduler == 'cyclic_cosine':
+        from transformers import get_cosine_with_hard_restarts_schedule_with_warmup
+        scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
+            optimizer,
+            args.num_warmup_steps,
+            args.num_training_steps,
+            int(args.epochs / 2)
+        )
+    elif args.scheduler == 'plateau':
+        raise NotImplementedError
+
+    norm_space = torch.cat((exs['name_embs'],
+                            torch.zeros(exs['name_embs'].size(-1)).unsqueeze(0)))
 
     # Train -------------------------------------------------------------------
     stats = utils.TraningStats()
