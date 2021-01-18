@@ -33,7 +33,7 @@ class IOB_ONE(JointMDEL):
         self.crf = CRF(2*cfg.LSTM_HIDDEN_DIM, st_dim)
         self.dropout = nn.Dropout(p=cfg.DROPOUT_RATIO)
 
-    def forward(self, exs):
+    def forward(self, exs, norm_space, pred_lvl_m=False):
         x, masks, y0, y1, y2 = exs
 
         x = x.to(self.device)
@@ -63,7 +63,7 @@ class IOB_ONE(JointMDEL):
         ent_out = self.matching(torch.cat((c_emb, soft_logits_st), dim=-1))
 
         # loss
-        ent_loss = self.focal_loss(ent_out, y2, masks, is_emb=True)
+        ent_loss = self.focal_loss(ent_out, y2, masks, norm_space=norm_space)
         joint_loss = (iobst_loss + ent_loss)
 
         if self.training:
@@ -98,5 +98,7 @@ class IOB_ONE(JointMDEL):
 
         outcomes = self.eval_retrieval_performance(t0=(pred_iob, y0, masks),
                                                    t1=(pred_st, y1_, masks),
-                                                   t2=(ent_out, y2, masks))
+                                                   t2=(ent_out, y2, masks),
+                                                   mention_level=pred_lvl_m,
+                                                   norm_space=norm_space)
         return outcomes, None, iobst_loss, ent_loss

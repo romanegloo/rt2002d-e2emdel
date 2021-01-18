@@ -19,16 +19,16 @@ from torch.utils.data import DataLoader
 from transformers import AdamW
 from transformers import AutoTokenizer
 
+from GoshiBoshi import IOB_HI, IOB_LO, IOB_ONE
 import GoshiBoshi.config as cfg
 from GoshiBoshi.data import MedMentionDataset, batchify
-from GoshiBoshi.model import JointMDEL_L, JointMDEL_H, JointMDEL_OT
 import GoshiBoshi.utils as utils
 from GoshiBoshi.loss import FocalLoss
 
 logger = logging.getLogger(__name__)
 
 
-def train(args, ds, mdl, crit, optim, sch, name_norm, stats):
+def train(args, ds, mdl, optim, sch, stats):
     """Fit the model over an epoch"""
     mdl.train()
     train_it = DataLoader(ds['trn'],
@@ -37,41 +37,39 @@ def train(args, ds, mdl, crit, optim, sch, name_norm, stats):
                           collate_fn=batchify)
     stats.n_exs = len(train_it)
     for batch in train_it:
-        inputs, segs, x_mask, y0, y1, y2 = batch
         optim.zero_grad()
-        out = mdl(inputs, segs, x_mask)
-        l, l0, l1, l2 = crit(out, y0, y1, y2, name_norm)
-        l.backward()
+        losses = mdl(batch, nn_trn)
+        losses[0].backward()
         optim.step()
         nn.utils.clip_grad_norm_(mdl.parameters(), 10)
         sch.step()
-        stats.update_trn((l0, l1, l2))
+        stats.update_trn(losses[1:])
 
         # Update stats
         if stats.steps % args.log_interval == 0:
             stats.lr = optim.param_groups[0]['lr']
             stats.report_trn()
         if stats.steps % args.eval_interval == 0:
-            dev_eval(args, ds, mdl, crit, name_norm, stats)
+            dev_eval(args, ds, mdl, stats)
 
 
-def dev_eval(args, ds, mdl, crit, name_norm, stats):
+def dev_eval(args, ds, mdl, stats):
     """Validation loop"""
     mdl.eval()
     it = DataLoader(ds['dev'], batch_size=args.batch_size, shuffle=True,
                     collate_fn=batchify)
     with torch.no_grad():
         for i, batch in enumerate(it):
-            inputs, segs, x_mask, y0, y1, y2 = batch
-            out = mdl(inputs, segs, x_mask)
-            l, l0, l1, l2 = crit(out, y0, y1, y2, name_norm)
-            ret_out = utils.retrieval_outcomes(out, batch, name_norm)
+            # inputs, segs, x_mask, y0, y1, y2 = batch
+            ret_out, l0, l1, l2 = mdl(batch, nn_dev)
+            # ret_out = utils.retrieval_metrics(out, batch, name_norm)
             stats.update_dev((l0, l1, l2), ret_out)
-            if i >= 300:
+            if i >= 500:
                 break
     stats.report_dev()
     if stats.is_best:
         utils.save_model(mdl, args, stats)
+    mdl.train()
 
 
 if __name__ == '__main__':
@@ -80,6 +78,11 @@ if __name__ == '__main__':
         'Joint Mention Dection and Entity Linking to complete PubTator',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
+    # Path
+    parser.add_argument('--ds_path', type=str, default=cfg.MM_DS_FILE,
+                        help="Path to a training dataset file")
+    parser.add_argument('--best_mdl_file', type=str, default=cfg.BEST_MDL_FILE,
+                        help="File path where to save the best trained model")
 
     # Model configuration
     parser.add_argument('--model_name', type=str, default=cfg.MDL_NAME,
@@ -87,8 +90,9 @@ if __name__ == '__main__':
                         help='Different models with varying IOB tagging positions')
     parser.add_argument('--batch_size', type=int, default=cfg.BSZ,
                         help='Number of examples in train/valid runs')
-    parser.add_argument('--max_sent_len', type=int, default=cfg.MAX_SENT_LEN,
-                        help='Maximum sequence length')
+    parser.add_argument('--x_max_sent_len', type=int, default=cfg.MAX_SENT_LEN,
+                        help='Maximum sentence length of inputs to BERT '
+                        '(in number of tokens)')
 
     # Optimization
     parser.add_argument('--lr', type=float, default=cfg.LR,
@@ -96,17 +100,19 @@ if __name__ == '__main__':
     parser.add_argument('--scheduler', type=str, default='linear',
                         choices=['linear', 'cyclic_cosine', 'plateau'],
                         help='Learning rate scheduler')
-    parser.add_argument('--focal_alpha', type=float, default=0.25,
+    parser.add_argument('--focal_alpha', type=float, default=0.3,
                         help='Focal loss parameter, alpha')
-    parser.add_argument('--focal_gamma', type=float, default=2.,
+    parser.add_argument('--focal_gamma1', type=float, default=5.,
+                        help='Focal loss parameter, gamma')
+    parser.add_argument('--focal_gamma2', type=float, default=3.,
                         help='Focal loss parameter, gamma')
 
     # Runtime environmnet
-    parser.add_argument('--epochs', type=int, default=3,
+    parser.add_argument('--epochs', type=int, default=cfg.EPOCHS,
                         help='Number of epochs to train')
-    parser.add_argument('--log_interval', type=int, default=100,
+    parser.add_argument('--log_interval', type=int, default=cfg.LOG_INTV,
                         help='Log interval for training')
-    parser.add_argument('--eval_interval', type=int, default=200,
+    parser.add_argument('--eval_interval', type=int, default=cfg.EVAL_INTV,
                         help='Log interval for validation')
 
     args = parser.parse_args()
@@ -135,14 +141,14 @@ if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained(cfg.BERT_MODEL)
 
     # Read a dataset
-    exs = pickle.load(open(cfg.MM_DS_FILE, 'rb'))
+    exs = pickle.load(open(args.ds_path, 'rb'))
     special_tokens = dict(zip(tokenizer.all_special_tokens,
                               tokenizer.all_special_ids))
-    ds = {mode: MedMentionDataset(exs['examples'], mode, exs['ni2cui'],
-                                  special_tokens=exs['bert_special_tokens_map'],
-                                  max_sent_len=args.max_sent_len,
-                                  one_tag=(args.model_name=='one-tag'))
-          for mode in ['trn', 'dev']}
+    ds = {
+        mode: MedMentionDataset(exs['examples'], mode, args.model_name,
+                                exs['ni2cui'])
+        for mode in ['trn', 'dev']
+    }
 
     # Default values for optimization
     args.num_training_steps = int(len(ds['trn']) / args.batch_size) * args.epochs
@@ -150,15 +156,30 @@ if __name__ == '__main__':
 
 
     # Model
+    # normalization space (zeros for the null class)
+    nn_trn = torch.cat(
+        (torch.index_select(exs['name_embs'], dim=0,
+                            index=torch.tensor(ds['trn'].nids)),
+         torch.zeros(exs['name_embs'].size(-1)).unsqueeze(0))
+    ).to(args.device)
+    nn_dev = torch.cat(
+        (torch.index_select(exs['name_embs'], dim=0,
+                            index=torch.tensor(ds['dev'].nids)),
+         torch.zeros(exs['name_embs'].size(-1)).unsqueeze(0))
+    ).to(args.device)
+    # name_embs = torch.cat(
+    #     (exs['name_embs'],
+    #      torch.zeros(exs['name_embs'].size(-1)).unsqueeze(0))
+    # ).to(args.device)
     if args.model_name == 'one-tag':
-        model = JointMDEL_OT(args)
+        print('ont-tag')
+        model = IOB_ONE(args)
     if args.model_name == 'tag-lo':
-        model = JointMDEL_L(args)
+        model = IOB_LO(args)
     elif args.model_name == 'tag-hi':
-        model = JointMDEL_H(args)
+        model = IOB_HI(args)
 
     model.to(args.device)
-    criterion = FocalLoss(alpha=args.focal_alpha, gamma=args.focal_gamma)
     optimizer = AdamW(model.parameters(), lr=float(args.lr))
     if args.scheduler == 'linear':
         from transformers import get_linear_schedule_with_warmup
@@ -178,13 +199,10 @@ if __name__ == '__main__':
     elif args.scheduler == 'plateau':
         raise NotImplementedError
 
-    norm_space = torch.cat((exs['name_embs'],
-                            torch.zeros(exs['name_embs'].size(-1)).unsqueeze(0)))
-
     # Train -------------------------------------------------------------------
     stats = utils.TraningStats()
     model.train()
     for epoch in range(1, args.epochs + 1):
         stats.epoch = epoch
         logger.info('*** Epoch %s starts ***', epoch)
-        train(args, ds, model, criterion, optimizer, scheduler, norm_space, stats)
+        train(args, ds, model, optimizer, scheduler, stats)

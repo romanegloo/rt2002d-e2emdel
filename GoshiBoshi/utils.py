@@ -3,15 +3,16 @@ utils.py
 
 Classes and methods used in common
 """
+import code
 import random
 import csv
 import logging
-import code
 from collections import defaultdict
 import os
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.nn import functional as F
 
 from transformers import AutoModel, AutoTokenizer
@@ -41,73 +42,6 @@ def sequence_mask(lengths, max_len=None):
             .repeat(batch_size, 1)
             .lt(lengths.unsqueeze(1)))
 
-def retrieval_outcomes(logits, batch, name_space):
-    """
-    Measure micro (token-level) retrieval performance
-
-    """
-    _, _, x_mask, y0, y1, y2 = batch
-    outcomes = {
-        'y0': { 'tp': 0, 'fp': 0, 'fn': 0},
-        'y1': { 'tp': 0, 'fp': 0, 'fn': 0},
-        'y2': { 'tp': 0, 'fp': 0, 'fn': 0}
-    }
-    out_iob, out_st, c_emb = \
-        (out[:,1:-1,:].to('cpu') if out is not None else None for out in logits)
-    x_mask = x_mask[:,1:-1]
-    logprobs_st = F.log_softmax(out_st, dim=-1)
-
-    # y0: IOB tagging
-    gt = y0.long().argmax(dim=-1)
-    null_idx_0 = 1  # 'O' in IOB
-    null_idx_1 = y1.size(-1) - 1 # Assume that last idx is for null class
-    if out_iob is None:
-        pred = out_st.argmax(dim=-1)
-        # Convert to IOB tensor
-        pred_y0 = torch.ones(pred.size(), dtype=torch.uint8)
-        pred_y0[(pred % 2 == 1) & (pred != null_idx_1)] = 0  # 'I'
-        pred_y0[(pred % 2 == 0) & (pred != null_idx_1)] = 2  # 'B'
-        pred_mask = (pred_y0 != null_idx_0).logical_and(x_mask)
-        pred = pred_y0
-        gt_mask = (gt != null_idx_0).logical_and(x_mask)
-    else:
-        pred = out_iob.argmax(dim=-1)
-        pred_mask = (pred != null_idx_0).logical_and(x_mask)
-        gt_mask = (gt != null_idx_0).logical_and(x_mask)
-    outcomes['y0']['tp'] = (pred[pred_mask] == gt[pred_mask]).sum().item()
-    outcomes['y0']['fp'] = (pred[pred_mask] != gt[pred_mask]).sum().item()
-    outcomes['y0']['fn'] = (gt[gt_mask] != pred[gt_mask]).sum().item()
-
-    # y1: Semantic types
-    if out_iob is None:
-        pred = F.avg_pool1d(out_st, kernel_size=2, ceil_mode=True).argmax(dim=-1)
-        gt = F.avg_pool1d(y1.double(), kernel_size=2, ceil_mode=True).argmax(dim=-1)
-        null_idx = int(y1.size(-1) / 2)
-    else:
-        pred = out_st.argmax(dim=-1)
-        gt = y1.long().argmax(dim=-1)
-        null_idx = y1.size(-1) - 1
-    pred_mask = (pred != null_idx).logical_and(x_mask)
-    gt_mask = (gt != null_idx).logical_and(x_mask)
-    outcomes['y1']['tp'] = (pred[pred_mask] == gt[pred_mask]).sum().item()
-    outcomes['y1']['fp'] = (pred[pred_mask] != gt[pred_mask]).sum().item()
-    outcomes['y1']['fn'] = (gt[gt_mask] != pred[gt_mask]).sum().item()
-
-    # y2: Entity linking
-    x = logprobs_st[:,:,:-1]
-    if out_iob is None:  # For the one-tag model
-        x = x.reshape(*(x.size()[:-1]), len(cfg.MM_ST), 2).sum(axis=-1)
-    norm_scores = torch.matmul(c_emb, name_space.T)
-    pred = norm_scores.argmax(dim=-1)
-    gt = y2.long().argmax(dim=-1)
-    null_idx = y2.size(-1) - 1
-    pred_mask = (pred != null_idx).logical_and(x_mask)
-    gt_mask = (gt != null_idx).logical_and(x_mask)
-    outcomes['y2']['tp'] = (pred[pred_mask] == gt[pred_mask]).sum().item()
-    outcomes['y2']['fp'] = (pred[pred_mask] != gt[pred_mask]).sum().item()
-    outcomes['y2']['fn'] = (gt[gt_mask] != pred[gt_mask]).sum().item()
-
-    return outcomes
 
 class TraningStats:
     def __init__(self):
@@ -117,14 +51,14 @@ class TraningStats:
         self.lr = 0
         self.loss = defaultdict(list)
         self.ret_outcomes = {
-            'y0': {'tp': 0, 'fp': 0, 'fn': 0},
-            'y1': {'tp': 0, 'fp': 0, 'fn': 0},
-            'y2': {'tp': 0, 'fp': 0, 'fn': 0}
+            't0': {'tp': 0, 'fp': 0, 'fn': 0},
+            't1': {'tp': 0, 'fp': 0, 'fn': 0},
+            't2': {'tp': 0, 'fp': 0, 'fn': 0}
         }
         self.ret_scores = {
-            'y0': defaultdict(list),
-            'y1': defaultdict(list),
-            'y2': defaultdict(list)
+            't0': defaultdict(list),
+            't1': defaultdict(list),
+            't2': defaultdict(list)
         }
         self.is_best = False
         self.best_score = 0
@@ -186,13 +120,13 @@ class TraningStats:
             msg = '[DEV] {} (p/r/f {:.3f}\t{:.3f}\t{:.3f})'.format(k1, p, r, f)
             logger.info(msg)
             # update best score
-            if k1 == 'y2' and self.best_score < f:
+            if k1 == 't2' and self.best_score < f:
                 self.is_best = True
                 self.best_score = f
         self.ret_outcomes = {
-            'y0': {'tp': 0, 'fp': 0, 'fn': 0},
-            'y1': {'tp': 0, 'fp': 0, 'fn': 0},
-            'y2': {'tp': 0, 'fp': 0, 'fn': 0}
+            't0': {'tp': 0, 'fp': 0, 'fn': 0},
+            't1': {'tp': 0, 'fp': 0, 'fn': 0},
+            't2': {'tp': 0, 'fp': 0, 'fn': 0}
         }
 
 def save_model(mdl, args, stat):
@@ -201,9 +135,9 @@ def save_model(mdl, args, stat):
         'args': args,
         'stat': stat,
     }
-    torch.save(checkpoint, cfg.BEST_MDL_FILE)
+    torch.save(checkpoint, args.best_mdl_file)
     logger.info(f'best score: {stat.best_score:.3f}, '
-                f' Saving a checkpoint {cfg.BEST_MDL_FILE}')
+                f' Saving a checkpoint {args.best_mdl_file}')
 
 
 ### create n-grams
@@ -222,3 +156,26 @@ def get_ngrams(string, n=3):
     string = re.sub(r'[,-./]|\sBD', r'', string)
     ngrams = zip(*[string[i:] for i in range(n)])
     return [''.join(ngram) for ngram in ngrams]
+
+
+def init_linear(input_linear):
+    """Initialize linear transformation
+    """
+    bias = np.sqrt(6.0 / (input_linear.weight.size(0) + input_linear.weight.size(1)))
+    nn.init.uniform_(input_linear.weight, -bias, bias)
+    if input_linear.bias is not None:
+        input_linear.bias.data.zero_()
+
+def log_sum_exp(vec, m_size):
+    """
+    calculate log of exp sum
+    args:
+        vec (batch_size, vanishing_dim, hidden_dim) : input tensor
+        m_size : hidden_dim
+    return:
+        batch_size, hidden_dim
+    """
+    _, idx = torch.max(vec, 1)  # B * 1 * M
+    max_score = torch.gather(vec, 1, idx.view(-1, 1, m_size)).view(-1, 1, m_size)  # B * M
+
+    return max_score.view(-1, m_size) + torch.log(torch.sum(torch.exp(vec - max_score.expand_as(vec)), 1)).view(-1, m_size)  # B * M

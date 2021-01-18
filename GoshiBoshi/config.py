@@ -1,8 +1,8 @@
 # Pretrained BERT
 BERT_MODEL = 'allenai/scibert_scivocab_uncased'
 BERT_MODEL_DIM = 768
-BERT_SPECIAL_TOKENS = {'[UNK]': 101, '[SEP]': 103, '[PAD]': 0, '[CLS]': 102,
-                       '[MASK]': 104}  # Default setup, if not specified
+BERT_SP_MAP = {'[UNK]': 101, '[SEP]': 103, '[PAD]': 0, '[CLS]': 102,
+               '[MASK]': 104}  # Default setup, if not specified
 
 # File Paths
 MM_RAW_FILE = 'data/MedMentions/corpus_pubtator.txt.gz'  # Medmentions dataset
@@ -17,18 +17,21 @@ UMLS_MRCONSO = 'data/UMLS/MRCONSO.RRF'  # UMLS CUIs
 UMLS_MRSTY = 'data/UMLS/MRSTY.RRF'  # UMLS semantic types
 UMLS_SRSTRE = 'data/UMLS/SRSTRE1'  # UMLS relationships between semantic types
 
-# Data
-MAX_NAME_LEN = 120
-
 # Run
 RND_SEED = 12345
 BSZ = 8          # Training batch size
 LR = 3e-5  # Starting learning rate
+EPOCHS = 8
+LOG_INTV = 1000
+EVAL_INTV = 3000
 
 # Model configuration
 MDL_NAME = 'tag-hi'  # Architectures with varying locations of IOB tagging
 MAX_SENT_LEN = 256   # Maximum sentence length of example inputs
 NAME_DIM = 384       # Dimension of concept name embeddings
+LSTM_HIDDEN_DIM = 256
+LSTM_NUM_LAYERS = 2
+DROPOUT_RATIO = 0.1
 
 
 # MedMentions

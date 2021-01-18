@@ -48,7 +48,7 @@ class Entity:
         self.names = []
         self.st = st
         self.st_root = st_root
-        self.mm_count = [0, 0, 0]  # Trn, Val, Tst
+        self.mm_count = [0, 0, 0]  # Trn, Dev, Tst
 
 
 class Entities:
@@ -480,7 +480,7 @@ if __name__ == '__main__':
     for cui, e in UMLS.cuis.items():
         if len(e.names) == 0:
             to_delete.append(cui)
-    print('{} deleted from {} cuis'.format(len(to_delete), total))
+    print('{} deleted from {} cucode.interact(local=dict(globals(), **locals()))is'.format(len(to_delete), total))
     for cui in to_delete:
         del UMLS.cuis[cui]
 
@@ -498,6 +498,7 @@ if __name__ == '__main__':
     }
     print('=> Saving training examples: {}'.format(args.file_mm_out))
     pickle.dump(out, open(args.file_mm_out, 'wb'))
+
 
     # if args.save_full_ns:
     #     ns, ns_ids = build_name_space(full=True)
