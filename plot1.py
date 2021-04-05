@@ -4,7 +4,8 @@ import code
 import numpy as np
 import pandas as pd
 import seaborn as sns
-sns.get_theme(style="whitegrid")
+sns.set_theme(style="whitegrid")
+import matplotlib as plt
 
 # Load stats
 onetag = pickle.load(open('data/onetag.pkl', 'rb'))

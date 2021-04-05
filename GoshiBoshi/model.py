@@ -104,7 +104,7 @@ class JointMDEL(nn.Module):
                                     batch_first=True, padding_value=-1)\
                                         .to(self.device)
             out1, y1, _ = t1
-            pred1 = out1.argmax(dim=-1)
+            pred1 = out1.argmax(dim=-1) if out1.dim() == 3 else out1
             out2, y2, _ = t2
             pred2 = torch.matmul(out2, norm_space.T).argmax(dim=-1)
             gt2 = y2.long().argmax(dim=-1)

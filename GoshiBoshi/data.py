@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class MedMentionDataset(Dataset):
 
     def __init__(self, exs, ds_type, mdl_type, ni2cui,
-                 max_sent_len=cfg.MAX_SENT_LEN, test_zero=False):
+                 max_sent_len=cfg.MAX_SENT_LEN, nn='mm'):
         """ MedMentions dataset class
 
         Args:
@@ -32,6 +32,9 @@ class MedMentionDataset(Dataset):
             ds_type (str): Running mode {'trn', 'dev', 'tst'}
             mdl_type (str): data format depends on model type
             ni2cui (list): name index to cui mapping, i.e., list of CUIs
+            nn (str): name normalization mode {'mm', 'tst_exc'}
+                'mm' for the entire MedMentions CUIs
+                'tst_exc' for the CUIs only appear in the test dataset
         """
         self.ds_type = ds_type
         self.mdl_type = mdl_type
@@ -57,22 +60,29 @@ class MedMentionDataset(Dataset):
             elif ds_type == 'dev' and n[2][1] > 0:
                 # Anything seen in the validation dataset
                 self.ni2cui.append(n)
-            elif ds_type == 'tst' and not test_zero and sum(n[2]) > 0:
-                self.ni2cui.append(n)
-            elif ds_type == 'tst' and test_zero and n[2][0] == 0 and n[2][2] > 0:
-                self.ni2cui.append(n)
+            elif ds_type == 'tst':
+                if nn == 'tst_exc':
+                    if n[2][0] == 0 and n[2][2] > 0: # CUIs in Tst exclusive
+                        self.ni2cui.append(n)
+                elif nn == 'mm':
+                    if sum(n[2][:3]) - n[2][3] > 0:
+                        self.ni2cui.append(n)
+        logger.info('ds_type: {}, nn space: {} [len {}]'.format(ds_type, nn,
+                                                            len(self.ni2cui)))
         self.nids = [n[0] for n in self.ni2cui]
 
         if self.ni2cui[-1][1] != 'N':  # Add 'N'ull class, if not exist
-            self.ni2cui.append((-1, 'N', [0, 0, 0]))
+            self.ni2cui.append((-1, 'N', [0, 0, 0, 0]))
 
         self.cui2idx = dict()
         for i, n in enumerate(self.ni2cui):
             if n[1] in self.cui2idx:
-                self.cui2idx[n[1]].append(i)
+                self.cui2idx[n[1]]['indices'].append(i)
             else:
-                self.cui2idx[n[1]] = [i]
-        # self.cui2idx['N'] = [len(ni2cui)-1]
+                self.cui2idx[n[1]] = {
+                    'tst_exc': (n[2][2] > 0 and n[2][0] == 0),
+                    'indices': [i]
+                }
 
     def __len__(self):
         return(len(self.examples))
@@ -88,7 +98,7 @@ class MedMentionDataset(Dataset):
 
         # Create default labels (y0, y1, y2)
         I, O, B = 0, 1, 2  # indices for each tag
-        TN, EN = self.st2idx['N'], self.cui2idx['N'][0]
+        TN, EN = self.st2idx['N'], self.cui2idx['N']['indices'][0]
 
         y0 = torch.zeros(len('IOB'), dtype=torch.bool)
         y0[O] = True
@@ -126,7 +136,7 @@ class MedMentionDataset(Dataset):
             if cui in self.cui2idx:
                 # cui might not be indexed in case it is in both trn and tst
                 # while testing zero-shot
-                tgt = self.cui2idx[entid[5:]]  # without 'UMLS:'
+                tgt = self.cui2idx[entid[5:]]['indices']  # without 'UMLS:'
                 y2[bi:bi+l, tgt], y2[bi:bi+l, EN] = True, False
 
         if self.ds_type == 'tst':

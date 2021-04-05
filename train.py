@@ -100,7 +100,7 @@ if __name__ == '__main__':
     parser.add_argument('--scheduler', type=str, default='linear',
                         choices=['linear', 'cyclic_cosine', 'plateau'],
                         help='Learning rate scheduler')
-    parser.add_argument('--focal_alpha', type=float, default=0.3,
+    parser.add_argument('--focal_alpha', type=float, default=1.0,
                         help='Focal loss parameter, alpha')
     parser.add_argument('--focal_gamma1', type=float, default=5.,
                         help='Focal loss parameter, gamma')

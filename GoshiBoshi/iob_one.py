@@ -34,7 +34,7 @@ class IOB_ONE(JointMDEL):
         self.dropout = nn.Dropout(p=cfg.DROPOUT_RATIO)
 
     def forward(self, exs, norm_space, pred_lvl_m=False):
-        x, masks, y0, y1, y2 = exs
+        x, masks, y0, y1, y2 = exs[:5]
 
         x = x.to(self.device)
         masks = masks.to(self.device)
@@ -81,12 +81,9 @@ class IOB_ONE(JointMDEL):
             nl_[nl_null] = 1
             pred_iob.append(nl_)
         pred_iob = pad_sequence([torch.tensor(l) for l in pred_iob],
-                                batch_first=True, padding_value=-1)\
-                                    .to(self.device)
-        pred_st = pad_sequence([torch.tensor(np.array(l)//2)
-                                for l in pred_iobst],
-                               batch_first=True, padding_value=-1)\
-                                   .to(self.device)
+                                batch_first=True, padding_value=-1).to(self.device)
+        pred_st = pad_sequence([torch.tensor(np.array(l)//2) for l in pred_iobst],
+                               batch_first=True, padding_value=-1).to(self.device)
         y1_ = torch.BoolTensor(y1.size(0), y1.size(1), 22).fill_(0).to(self.device)
         y1_[:,:,-1] = True
         for i, l in enumerate(y1):

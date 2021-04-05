@@ -48,7 +48,7 @@ class Entity:
         self.names = []
         self.st = st
         self.st_root = st_root
-        self.mm_count = [0, 0, 0]  # Trn, Dev, Tst
+        self.mm_count = [0, 0, 0, 0]  # Trn, Dev, Tst, augmented
 
 
 class Entities:
@@ -313,10 +313,10 @@ def gen_counterfactual_examples(exs):
             ex_ = deepcopy(ex)
             ex_['annotations'] = []
             ex_['generated'] = True
-            # Change half of the annotations
             offset = 0
             altered = False
             for i, a in enumerate(ex['annotations']):
+                # Change half of the annotations
                 if random.random() > .7:  # replace
                     altered = True
                     cui = a[4][5:]
@@ -328,17 +328,17 @@ def gen_counterfactual_examples(exs):
                     ex_['annotations'].append((a[0]+offset, len(tokens),
                                                name, a[3], f'UMLS:{new_cui}'))
                     offset += len(tokens) - a[1]
+                    UMLS.cuis[new_cui].mm_count[3] += 1
                 else:
                     ex_['annotations'].append((a[0]+offset, *a[1:]))
             ex_['token_ids'] = tokenizer.convert_tokens_to_ids(ex_['tokens'])
             if altered:
                 new_examples.append(ex_)
-        for annt in ex_['annotations']:
-            cui = annt[4][5:]
-            if not annt[2].lower() in [n for n in UMLS.cuis[cui].names]:
-                UMLS.cuis[cui].names.append(annt[2].lower())
-            UMLS.cuis[cui].mm_count[0] += 1  # +1 occurrence in training
-
+                for annt in ex_['annotations']:
+                    cui = annt[4][5:]
+                    if not annt[2].lower() in [n for n in UMLS.cuis[cui].names]:
+                        UMLS.cuis[cui].names.append(annt[2].lower())
+                    UMLS.cuis[cui].mm_count[0] += 1  # +1 occurrence in training
     return new_examples
 
 
@@ -472,7 +472,6 @@ if __name__ == '__main__':
     # Read and convert MedMentions annotation examples
     examples = read_mm_examples()
 
-
     # Exclude the CUIs that do not have any name associated with
     print('=> Deleting all the CUIs without a name')
     to_delete = []
@@ -480,7 +479,7 @@ if __name__ == '__main__':
     for cui, e in UMLS.cuis.items():
         if len(e.names) == 0:
             to_delete.append(cui)
-    print('{} deleted from {} cucode.interact(local=dict(globals(), **locals()))is'.format(len(to_delete), total))
+    print('{} deleted from {} cuis'.format(len(to_delete), total))
     for cui in to_delete:
         del UMLS.cuis[cui]
 

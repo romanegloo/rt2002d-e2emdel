@@ -30,9 +30,8 @@ class FocalLoss(nn.Module):
             reduction='none'
         )
         pt = torch.exp(-ce)
-        loss_focal = torch.where(pt < 0.2, (1-pt)**self.gamma1,
+        loss_focal = torch.where(pt < 0.3, (1-pt)**self.gamma1,
                                            (1-pt)**self.gamma2)
         loss_focal = self.alpha * loss_focal * ce
 
         return loss_focal.view(bsz, lens)[masks].sum() / bsz
-        return loss

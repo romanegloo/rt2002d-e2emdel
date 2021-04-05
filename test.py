@@ -8,7 +8,7 @@ import logging
 import argparse
 import pickle
 from tqdm import tqdm
-from collections import namedtuple, Counter
+from collections import namedtuple, Counter, defaultdict
 
 import torch
 from torch.utils.data import DataLoader
@@ -72,7 +72,11 @@ class MM_Eval:
             precision = s['tp'] / (s['tp'] + s['fp'] + epsilon)
             recall = s['tp'] / (s['tp'] + s['fn'] + epsilon)
             f1 = 2 * precision * recall / (precision + recall)
-            print('[{}] p {:.3} r {:.3} f1 {:.3}'.format(t, precision, recall, f1))
+            if t != 't2':
+                print('{:.3} & {:.3} & {:.3} &'.format(precision, recall, f1))
+            else:
+                print('{:.3} & {:.3} & {:.3} \\\\'.format(precision, recall, f1))
+
 
     def compute_retrieval_metrics(self, predictions, annotations):
         # Read GT annotations in dictionary
@@ -104,13 +108,25 @@ class MM_Eval:
             if len(t) > 0 and len(e) > 0:
                 pred_[k] = predictions[k]
 
+        seen_mention_spans = [(k[0], k[1], k[1] + m[0]) for k, m in gt.items()
+                              if not (m[2] in self.ds.cui2idx and
+                                      self.ds.cui2idx[m[2]]['tst_exc'])]
         for k, (l, t, e) in pred_.items():
             # k: key, l: mention length,
             # t: list of predicted types, e: list of predicted entities
             t = [v for v in t if v != t1_nill]
             e = [v for v in e if v != t2_nill]
+            if self.args.zero_shot:
+                # Skip any predictions that overlap mentions of the seen entities
+                if any(k[0] == m[0] and
+                       ((m[1] <= k[1] < m[2]) or (m[1] <= k[1]+l-1 < m[2]))
+                       for m in seen_mention_spans):
+                    continue
+
             if k in gt and l == gt[k][0]:
-                if self.args.zero_shot and gt[k][2] not in self.ds.cui2idx:
+                if self.args.zero_shot and \
+                        not (gt[k][2] in self.ds.cui2idx and
+                             self.ds.cui2idx[gt[k][2]]['tst_exc']):
                     continue
                 metrics['t0']['tp'] += 1
                 t_maj = Counter(t).most_common()[0][0] if l > 2 else t[0]
@@ -119,18 +135,25 @@ class MM_Eval:
                 else:
                     metrics['t1']['fp'] += 1
                 e_maj = Counter([self.ds.ni2cui[i][1] for i in e]).most_common()[0][0]
-                # e_maj = Counter([self.ds.ni2cui[self.ds.nids[i]][1] for i in e]) \
-                #         .most_common()[0][0]
                 if e_maj == gt[k][2]:
                     metrics['t2']['tp'] += 1
                 else:
                     metrics['t2']['fp'] += 1
-            else:
+            else:  # fp^o
+                if self.args.zero_shot:
+                    e_maj = Counter([self.ds.ni2cui[i][1] for i in e]) \
+                            .most_common()[0][0]
+                    if e_maj not in self.ds.cui2idx or \
+                            not self.ds.cui2idx[e_maj]['tst_exc']:
+                        continue
                 for t in metrics:
                     metrics[t]['fp'] += 1
         for t in metrics:
             if self.args.zero_shot:
-                n = sum([1 for k, annt in gt.items() if annt[2] in self.ds.cui2idx])
+                # n = sum([1 for k, annt in gt.items() if annt[2] in self.ds.cui2idx])
+                n = sum([1 for k, annt in gt.items()
+                         if (annt[2] in self.ds.cui2idx and
+                             self.ds.cui2idx[annt[2]]['tst_exc'])])
             else:
                 n = len(gt)
             metrics[t]['fn'] = n - metrics[t]['tp']
@@ -157,8 +180,11 @@ if __name__ == '__main__':
                         help='MedMention file containing processed examples')
     # Runtime
     parser.add_argument('--zero_shot', action='store_true',
-                        help='name normalization space is restricted to the '
-                        'test dataset exclusively')
+                        help='Compute the performance only with the annotations '
+                        'that appear in the test dataset')
+    parser.add_argument('--nn', type=str, default='mm',
+                        help='Name normalization space (mm: full mm CUIs, '
+                        'tst_ex: test exclusive CUIs)')
     parser.add_argument('--random_seed', type=int, default=cfg.RND_SEED,
                         help='Random seed')
     args = parser.parse_args()
@@ -190,7 +216,7 @@ if __name__ == '__main__':
     mm = pickle.load(open(args.mm_file, 'rb'))
     evaluator.ds = MedMentionDataset(mm['examples'], 'tst',
                                      evaluator.args.model_name, mm['ni2cui'],
-                                     test_zero=args.zero_shot)
+                                     nn=args.nn)
 
     nn_tst = torch.cat(
         (torch.index_select(mm['name_embs'], dim=0,
@@ -199,20 +225,6 @@ if __name__ == '__main__':
     ).to(args.device)
     evaluator.norm_space = nn_tst
     evaluator.load_model()
-
-#     if args.use_mm_subset:  # if use_mm_subset, load from mm dataset
-#         logger.info('using_subset_ns: Loading norm space from mm dataset')
-#         name_embs = torch.cat(
-#             (mm['name_embs'],
-#              torch.zeros(mm['name_embs'].size(-1)).unsqueeze(0))
-#         ).to(args.device)
-#         evaluator.ni2cui = mm['ni2cui'] + ['N']
-#     else:
-#         logger.info('using full ns: Loading from {}'.format(args.norm_file))
-#         norm_space = pickle.load(open(args.norm_file, 'rb'))
-#         name_embs = norm_space['name_embs'].to(args.device)
-#         evaluator.ni2cui = norm_space['ni2cui'] + ['N']
-
 
     # Run~!
     evaluator.test_mm()

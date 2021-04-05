@@ -1,6 +1,4 @@
-playground/
-.vscode/
 data/
 doc/
 __pycache__/
-run.sh
+.idea/
