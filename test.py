@@ -8,21 +8,23 @@ import logging
 import argparse
 import pickle
 from tqdm import tqdm
-from collections import namedtuple, Counter, defaultdict
+from collections import Counter
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
 
 import GoshiBoshi.utils as utils
 from GoshiBoshi.data import MedMentionDataset, batchify
-from GoshiBoshi import IOB_HI, IOB_LO, IOB_ONE
+from GoshiBoshi import IOB_HI, IOB_ONE
 import GoshiBoshi.config as cfg
 
 logger = logging.getLogger(__name__)
 
 
-class MM_Eval:
-    """Evaluation class for Entity Recognition and Linking with MedMention DS"""
+class EvalMM:
+    """Evaluation class for NER and EN with MedMention DS"""
     def __init__(self, args):
         self.args = args
         self.st = cfg.MM_ST
@@ -33,6 +35,12 @@ class MM_Eval:
             't1': {'tp': 0, 'fp': 0, 'fn': 0},
             't2': {'tp': 0, 'fp': 0, 'fn': 0}
         }
+        # ST conversion counts: [o, x, o->x, x->o]
+        self.conversion_counts = [0, 0, 0, 0]
+        self.conversion_matrix = np.zeros((len(self.st), len(self.st)),
+                                          dtype=int)
+        self.miss_matrix = np.zeros((len(self.st), len(self.st)),
+                                    dtype=int)
         self.checkpoint = torch.load(self.args.best_mdl_file)
         self.override_configs(self.checkpoint['args'])
         self.model = None
@@ -62,9 +70,11 @@ class MM_Eval:
                                                   self.norm_space,
                                                   pred_lvl_m=True)
                 self.compute_retrieval_metrics(predictions, batch[5])
+                self.error_analysis(predictions, batch)
                 e = 'tp {} fp {} fn {}'.format(*list(self.metrics['t2'].values()))
                 pbar.set_description(e)
                 pbar.update()
+
         pbar.close()
 
         epsilon = 1e-7
@@ -77,90 +87,115 @@ class MM_Eval:
             else:
                 print('{:.3} & {:.3} & {:.3} \\\\'.format(precision, recall, f1))
 
+    def error_analysis(self, predictions, batch):
+        annotations = batch[5]
+        gt, pred = self.get_gt_pred(predictions, annotations)
+        # for k in gt:
+        #     if k not in predictions:
+        #         code.interact(local=dict(globals(), **locals()))
+
+        for k, (l, t, e) in pred.items():
+            if k in gt and l == gt[k][0]:
+                i, j = self.st.index(t), self.st.index(cuis[e].st_root)
+                self.conversion_matrix[i][j] += 1
+                if t == gt[k][1]:
+                    self.conversion_counts[0] += 1
+                    if cuis[e].st_root != gt[k][1]:
+                        self.conversion_counts[2] += 1
+                else:
+                    self.conversion_counts[1] += 1
+                    if cuis[e].st_root == gt[k][1]:
+                        self.conversion_counts[3] += 1
+                if e != gt[k][2]:
+                    i = self.st.index(gt[k][1])
+                    j = self.st.index(cuis[e].st_root)
+                    self.miss_matrix[i][j] += 1
 
     def compute_retrieval_metrics(self, predictions, annotations):
-        # Read GT annotations in dictionary
-        gt = dict()
-        for i, annts in enumerate(annotations):
-            for bi, l, _, t, e in annts:
-                gt[(i, bi+1)] = (l, t, e[5:])
-                    # Remove 'UMLS:' from e,
-                    # prediction index counts +1 for BOS token
-
+        gt, pred = self.get_gt_pred(predictions, annotations)
         metrics = {
             't0': {'tp': 0, 'fp': 0, 'fn': 0},
             't1': {'tp': 0, 'fp': 0, 'fn': 0},
             't2': {'tp': 0, 'fp': 0, 'fn': 0}
         }
-        # Remove predicted mentions that contain only null classes
-        t1_nill = len(self.st)
-        t2_nill = len(self.ds.nids)
-        pred_ = dict()
-        for k, (l, t, e) in predictions.items():
-            # right-trim
-            if l >= 2 and (t[-1] != t[-2] or e[-1] != e[-2]):
-                l = l - 1
-                t = t[:-1]
-                e = e[:-1]
-            # remove unclassified mentions
-            t = [v for v in t if v != t1_nill]
-            e = [v for v in e if v != t2_nill]
-            if len(t) > 0 and len(e) > 0:
-                pred_[k] = predictions[k]
-
-        seen_mention_spans = [(k[0], k[1], k[1] + m[0]) for k, m in gt.items()
-                              if not (m[2] in self.ds.cui2idx and
-                                      self.ds.cui2idx[m[2]]['tst_exc'])]
-        for k, (l, t, e) in pred_.items():
-            # k: key, l: mention length,
-            # t: list of predicted types, e: list of predicted entities
-            t = [v for v in t if v != t1_nill]
-            e = [v for v in e if v != t2_nill]
-            if self.args.zero_shot:
-                # Skip any predictions that overlap mentions of the seen entities
-                if any(k[0] == m[0] and
-                       ((m[1] <= k[1] < m[2]) or (m[1] <= k[1]+l-1 < m[2]))
-                       for m in seen_mention_spans):
-                    continue
-
+        for k, (l, t, e) in pred.items():
             if k in gt and l == gt[k][0]:
-                if self.args.zero_shot and \
+                if self.args.zero_shot and\
                         not (gt[k][2] in self.ds.cui2idx and
                              self.ds.cui2idx[gt[k][2]]['tst_exc']):
                     continue
                 metrics['t0']['tp'] += 1
-                t_maj = Counter(t).most_common()[0][0] if l > 2 else t[0]
-                if self.st[t_maj] == gt[k][1]:
+                if t == gt[k][1]:
                     metrics['t1']['tp'] += 1
                 else:
                     metrics['t1']['fp'] += 1
-                e_maj = Counter([self.ds.ni2cui[i][1] for i in e]).most_common()[0][0]
-                if e_maj == gt[k][2]:
+                if e == gt[k][2]:
                     metrics['t2']['tp'] += 1
                 else:
                     metrics['t2']['fp'] += 1
             else:  # fp^o
-                if self.args.zero_shot:
-                    e_maj = Counter([self.ds.ni2cui[i][1] for i in e]) \
-                            .most_common()[0][0]
-                    if e_maj not in self.ds.cui2idx or \
-                            not self.ds.cui2idx[e_maj]['tst_exc']:
-                        continue
-                for t in metrics:
-                    metrics[t]['fp'] += 1
-        for t in metrics:
+                if not (e in self.ds.cui2idx and self.ds.cui2idx[e]['tst_exc']):
+                    continue
+                for ck in metrics:
+                    metrics[ck]['fp'] += 1
+        for ck in metrics:
             if self.args.zero_shot:
-                # n = sum([1 for k, annt in gt.items() if annt[2] in self.ds.cui2idx])
                 n = sum([1 for k, annt in gt.items()
                          if (annt[2] in self.ds.cui2idx and
                              self.ds.cui2idx[annt[2]]['tst_exc'])])
             else:
                 n = len(gt)
-            metrics[t]['fn'] = n - metrics[t]['tp']
+            metrics[ck]['fn'] = n - metrics[ck]['tp']
 
-        for t in metrics:
-            for s in metrics[t]:
-                self.metrics[t][s] += metrics[t][s]
+        for ck in metrics:
+            for s in metrics[ck]:
+                self.metrics[ck][s] += metrics[ck][s]
+
+    def get_gt_pred(self, predictions, annotations):
+        gt = dict()
+        pred = dict()
+        for i, annts in enumerate(annotations):
+            for bi, l, _, t, e in annts:
+                # Remove 'UMLS:' from e,
+                # prediction index counts +1 for BOS token
+                gt[(i, bi+1)] = (l, t, e[5:])
+        # Remove predictions that contain only null classes
+        t1_nill = len(self.st)
+        t2_nill = len(self.ds.nids)
+
+        # k: key, l: length of a mention,
+        # t: list of token-level type predictions
+        # e: list of token-level entity predictions
+        seen_mention_spans = None
+        if self.args.zero_shot:
+            seen_mention_spans =\
+                [(k[0], k[1], k[1] + m[0]) for k, m in gt.items()
+                 if not (m[2] in self.ds.cui2idx and
+                         self.ds.cui2idx[m[2]]['tst_exc'])]
+        for k, (l, t, e) in predictions.items():
+            # # right trim
+            # if l >= 2 and (t[-1] != t[-2] or e[-1] != e[-2]):
+            #     t = t[:-1]
+            #     e = e[:-1]
+            # remove unclassified mentions
+            t = [v for v in t if v != t1_nill]
+            e = [v for v in e if v != t2_nill]
+            if len(t) == 0 or len(e) == 0:
+                continue
+            # Skip any predictions that overlap a mention of seen entity
+            if self.args.zero_shot:
+                if any(k[0] == m[0] and
+                       ((m[1] <= k[1] < m[2]) or (m[1] <= k[1] + l - 1 < m[2]))
+                       for m in seen_mention_spans):
+                    continue
+                # if not (gt[k][2] in self.ds.cui2idx and
+                #         self.ds.cui2idx[gt[k][2]]['tst_exc']):
+                #     continue
+            t_maj = Counter(t).most_common()[0][0] if l > 2 else t[0]
+            e_maj = Counter(e).most_common()[0][0] if l > 2 else e[0]
+            pred[k] = (predictions[k][0], self.st[t_maj],
+                       self.ds.ni2cui[e_maj][1])
+        return gt, pred
 
 
 if __name__ == '__main__':
@@ -210,13 +245,15 @@ if __name__ == '__main__':
         logger.info('Running on CPUs')
 
     # Load an evaluator
-    evaluator = MM_Eval(args)
+    evaluator = EvalMM(args)
 
     # Load name normalization space
     mm = pickle.load(open(args.mm_file, 'rb'))
+    cuis = mm['cuis']
     evaluator.ds = MedMentionDataset(mm['examples'], 'tst',
                                      evaluator.args.model_name, mm['ni2cui'],
                                      nn=args.nn)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.BERT_MODEL)
 
     nn_tst = torch.cat(
         (torch.index_select(mm['name_embs'], dim=0,
