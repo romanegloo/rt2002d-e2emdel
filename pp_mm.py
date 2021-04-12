@@ -29,7 +29,6 @@ import re
 import random
 from collections import defaultdict
 import pickle
-from itertools import accumulate
 from copy import deepcopy
 
 from nltk.tokenize import sent_tokenize
@@ -37,87 +36,11 @@ from tqdm import tqdm
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer, AutoModel
+from tokenizers import BertWordPieceTokenizer
 
+import GoshiBoshi
 import GoshiBoshi.config as cfg
 import GoshiBoshi.utils as utils
-
-
-class Entity:
-    def __init__(self, id, st=None, st_root=None):
-        self.str_id = id
-        self.names = []
-        self.st = st
-        self.st_root = st_root
-        self.mm_count = [0, 0, 0, 0]  # Trn, Dev, Tst, augmented
-
-
-class Entities:
-    def __init__(self):
-        self.cuis = dict()
-        # Read the UMLS semantic type 'is-a' relationships
-        self.st_rel = self.read_st_rel()
-        # Read CUIs
-        self.read_cuis()
-        # Filter CUIs and read names of them
-        self.read_cui_names()
-
-    def read_st_rel(self):
-        """Read the hierarchical relationships between UMLS semantic types;
-        this is for merging the descendents of 21 semantic types to the
-        top-level.
-        """
-        st_map = {t: t for t in cfg.MM_ST}  # initialize with the 21 types
-        with open(cfg.UMLS_SRSTRE) as f:
-            while True:
-                len_before = len(st_map)
-                for line in f:
-                    st1, r, st2, _ = line.split('|')
-                    if st2 in st_map and r == 'T186':  # T186: 'is-a' relationship
-                        st_map[st1] = st_map[st2]
-                if len(st_map) != len_before:  # Repeat
-                    f.seek(0)
-                else:
-                    break
-        return st_map
-
-    def read_cuis(self):
-        """Reading CUIs that belong to the 21 semantic types and descendents"""
-        print('=> Reading CUIs from MRSTY...')
-        with open(cfg.UMLS_MRSTY) as f:
-            for line in f:
-                flds = line.split('|')
-                if flds[1] in self.st_rel:
-                    self.cuis[flds[0]] = Entity(flds[0], st=flds[1],
-                                                st_root=self.st_rel[flds[1]])
-        print(f'- {len(self.cuis)} CUIs found for the st21pv semantic types')
-
-    def read_cui_names(self):
-        """Filter CUIS with certian criteria and Read cui names from MRCONSO"""
-        print('=> Reading CUI names from MRCONSO...')
-
-        pbar = tqdm(total=15479756)
-        with open(cfg.UMLS_MRCONSO) as f:
-            for line in f:
-                pbar.update()
-                flds = line.split('|')
-                # 0: CUI, 1: LAT, 2: TS, 4: STT, 6: ISPREF, 11: TTY, 14: STRING
-                if flds[0] in self.cuis and\
-                        flds[1] == 'ENG' and\
-                        flds[2] == 'P' and\
-                        flds[4] == 'PF' and\
-                        flds[11] in cfg.MM_ONT and\
-                        flds[16] == 'N':
-                    if flds[14].lower() not in [n for n in self.cuis[flds[0]].names]:
-                        self.cuis[flds[0]].names.append(flds[14].lower())
-        pbar.close()
-
-    def __len__(self):
-        return len(self.cuis)
-
-    def __getitem__(self, k):
-        if k in self.cuis:
-            return self.cuis[k]
-        return
 
 
 def read_mm_examples():
@@ -142,6 +65,38 @@ def read_mm_examples():
     return mm_examples
 
 
+def convert_sent_chars_to_token_ids(s):
+    s = normalizer_fn(s)  # Use the same normalization function used in tokenizer
+    tokens = tokenizer.tokenize(s)
+    idx_str = []
+    idx = 0
+    pos = 0
+    for t in tokens:
+        # skip spaces
+        while True:
+            if s[pos] == ' ' and pos < len(s):
+                pos += 1
+                idx_str.append(idx-1)
+            else:
+                break
+        if pos >= len(s):
+            break
+        if t == '[UNK]':  # discard (backward tracing is too difficult)
+            return []
+        elif t.startswith('##'):
+            if s[pos:].startswith(t[2:]):
+                idx_str.extend([idx] * (len(t) - 2))
+                pos += len(t) - 2
+                idx += 1
+        else:
+            if s[pos:].startswith(t):
+                idx_str.extend([idx] * len(t))
+                pos += len(t)
+                idx += 1
+
+    return idx_str
+
+
 def align_annts(ex, annts, offsets):
     """Bert tokenizer chunks a sentence into subword tokens,
     while MedMentions dataset annotates tokens in word-level. So, an additional
@@ -153,51 +108,43 @@ def align_annts(ex, annts, offsets):
         annts: global (doc) list of annotations
         offsets: offsets of sentences in character positions
     """
-
     offsets.append(offsets[-1] + len(ex['raw']) + 1)
-    aligned = []
+    aligned = []  # container for annotations on subword-level tokens
 
-    # We need to keep track of the character positions between the origial
-    # and the sub-word tokenized tokens (including [UNK])
-
-    # Tokenization should be done per word
-    tok_to_orig_index = []
-    orig_to_tok_index = []
+    # Tokenization should be done per word in order to keep track of
+    # subtoken-token mapping for labeling
+    tok_to_word_index = []
     word_split_tokens = ex['raw'].split()
     word_split_offsets = [0]
     for w in word_split_tokens:
         word_split_offsets.append(word_split_offsets[-1] + len(w) + 1)
     all_tokens = []
-    for (i, token) in enumerate(ex['raw'].split()):
-        orig_to_tok_index.append(len(all_tokens))
+    for (i, token) in enumerate(word_split_tokens):
         sub_tokens = tokenizer.tokenize(token)
         for sub_token in sub_tokens:
-            tok_to_orig_index.append(i)
+            tok_to_word_index.append(i)
             all_tokens.append(sub_token)
+
     ex['tokens'] = all_tokens
     ex['token_ids'] = tokenizer.convert_tokens_to_ids(all_tokens)
+    _mapping = convert_sent_chars_to_token_ids(ex['raw'])
+    assert len(_mapping) != 0
 
     for annt in annts:
-        if int(annt[2]) < offsets[-2]:  # annotations of previous sentences
+        if int(annt[2]) < offsets[-2]:   # annt belongs to the previous sent.
             continue
-        if int(annt[1]) >= offsets[-1]: # annotations of following sentences
+        if int(annt[2]) > offsets[-1]:  # ann belongs to the following sent
             break
         b, e = int(annt[1]) - offsets[-2], int(annt[2]) - offsets[-2]
-        if b < 0:
-            raise IndexError  # merging attempt will be done in proc_doc
-        # compute span boundaries
-        span = [0, word_split_offsets[-1]]
-        for (i, v) in enumerate(word_split_offsets):
-            if v <= b:
-                span[0] = i
-            if v < e:
-                span[1] = i
-        span_in_subtokens = \
-            [i for (i, v) in enumerate(tok_to_orig_index)
-                if span[0] <= v <= span[1]]
+        assert 0 <= b < e
 
-        aligned.append((span_in_subtokens[0], len(span_in_subtokens), *annt[3:]))
+        try:
+            aligned.append((_mapping[b], _mapping[e-1]-_mapping[b]+1, *annt[3:]))
+        except IndexError:
+            raise AssertionError
     ex['annotations'] = aligned
+    if ex['pmid'] == '27352045' and ex['sent_no'] == 12:
+        code.interact(local=dict(globals(), **locals()))
 
 
 def proc_doc(doc):
@@ -221,16 +168,16 @@ def proc_doc(doc):
     r_body = re.compile(r'^((\d+)\|a\|)(.*)$')
     r_annt = re.compile(r'^(\S+)\t(\d+)\t(\d+)\t(.*)\t(.*)\t(.*)$')
 
-    for l in doc:
-        m = r_title.match(l)
+    for line in doc:
+        m = r_title.match(line)
         if m:
             if pmid == '':
                 pmid = m.group(2)
             title = m.group(3)
-        m = r_body.match(l)
+        m = r_body.match(line)
         if m:
             body = m.group(3)
-        m = r_annt.match(l)
+        m = r_annt.match(line)
         if m:
             annotations.append(m.group(0).split('\t'))
 
@@ -254,7 +201,7 @@ def proc_doc(doc):
             ex['ds'] = 'tst'
         try:
             align_annts(ex, annotations, offsets)
-        except IndexError:  # ignore this doc
+        except AssertionError:  # ignore this doc
             return []
         else:
             exs.append(ex)
@@ -461,13 +408,14 @@ if __name__ == '__main__':
 
     # Load pretrained BERT model
     tokenizer = AutoTokenizer.from_pretrained(cfg.BERT_MODEL)
+    normalizer_fn = BertWordPieceTokenizer().normalize
     encoder = AutoModel.from_pretrained(cfg.BERT_MODEL,
                                         output_hidden_states=True)
     encoder.to(args.device)
     encoder.eval()
 
     # Read CUIs
-    UMLS = Entities()
+    UMLS = GoshiBoshi.Entities()
 
     # Read and convert MedMentions annotation examples
     examples = read_mm_examples()
@@ -494,10 +442,10 @@ if __name__ == '__main__':
         'examples': examples,
         'name_embs': ns[:len(ns_ids)],
         'ni2cui': ns_ids,
+        'cuis': UMLS.cuis
     }
     print('=> Saving training examples: {}'.format(args.file_mm_out))
     pickle.dump(out, open(args.file_mm_out, 'wb'))
-
 
     # if args.save_full_ns:
     #     ns, ns_ids = build_name_space(full=True)
