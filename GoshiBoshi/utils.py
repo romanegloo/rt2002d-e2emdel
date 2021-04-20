@@ -10,6 +10,7 @@ import logging
 from collections import defaultdict
 import os
 
+from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn as nn
@@ -42,6 +43,83 @@ def sequence_mask(lengths, max_len=None):
             .repeat(batch_size, 1)
             .lt(lengths.unsqueeze(1)))
 
+
+class Entity:
+    def __init__(self, id, st=None, st_root=None):
+        self.str_id = id
+        self.names = []
+        self.st = st
+        self.st_root = st_root
+        self.mm_count = [0, 0, 0, 0]  # Trn, Dev, Tst, augmented
+
+
+class Entities:
+    def __init__(self):
+        self.cuis = dict()
+        # Read the UMLS semantic type 'is-a' relationships
+        self.st_rel = self.read_st_rel()
+        # Read CUIs
+        self.read_cuis()
+        # Filter CUIs and read names of them
+        self.read_cui_names()
+
+    def read_st_rel(self):
+        """Read the hierarchical relationships between UMLS semantic types;
+        this is for merging the descendents of 21 semantic types to the
+        top-level.
+        """
+        st_map = {t: t for t in cfg.MM_ST}  # initialize with the 21 types
+        with open(cfg.UMLS_SRSTRE) as f:
+            while True:
+                len_before = len(st_map)
+                for line in f:
+                    st1, r, st2, _ = line.split('|')
+                    if st2 in st_map and r == 'T186':  # T186: 'is-a' relationship
+                        st_map[st1] = st_map[st2]
+                if len(st_map) != len_before:  # Repeat
+                    f.seek(0)
+                else:
+                    break
+        return st_map
+
+    def read_cuis(self):
+        """Reading CUIs that belong to the 21 semantic types and descendents"""
+        print('=> Reading CUIs from MRSTY...')
+        with open(cfg.UMLS_MRSTY) as f:
+            for line in f:
+                flds = line.split('|')
+                if flds[1] in self.st_rel:
+                    self.cuis[flds[0]] = Entity(flds[0], st=flds[1],
+                                                st_root=self.st_rel[flds[1]])
+        print(f'- {len(self.cuis)} CUIs found for the st21pv semantic types')
+
+    def read_cui_names(self):
+        """Filter CUIS with certian criteria and Read cui names from MRCONSO"""
+        print('=> Reading CUI names from MRCONSO...')
+
+        pbar = tqdm(total=15479756)
+        with open(cfg.UMLS_MRCONSO) as f:
+            for line in f:
+                pbar.update()
+                flds = line.split('|')
+                # 0: CUI, 1: LAT, 2: TS, 4: STT, 6: ISPREF, 11: TTY, 14: STRING
+                if flds[0] in self.cuis and \
+                        flds[1] == 'ENG' and \
+                        flds[2] == 'P' and \
+                        flds[4] == 'PF' and \
+                        flds[11] in cfg.MM_ONT and \
+                        flds[16] == 'N':
+                    if flds[14].lower() not in [n for n in self.cuis[flds[0]].names]:
+                        self.cuis[flds[0]].names.append(flds[14].lower())
+        pbar.close()
+
+    def __len__(self):
+        return len(self.cuis)
+
+    def __getitem__(self, k):
+        if k in self.cuis:
+            return self.cuis[k]
+        return
 
 class TraningStats:
     def __init__(self):

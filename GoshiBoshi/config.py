@@ -21,13 +21,13 @@ UMLS_SRSTRE = 'data/UMLS/SRSTRE1'  # UMLS relationships between semantic types
 RND_SEED = 12345
 BSZ = 8          # Training batch size
 LR = 3e-5  # Starting learning rate
-EPOCHS = 8
+EPOCHS = 12
 LOG_INTV = 1000
 EVAL_INTV = 3000
 
 # Model configuration
 MDL_NAME = 'tag-hi'  # Architectures with varying locations of IOB tagging
-MAX_SENT_LEN = 256   # Maximum sentence length of example inputs
+MAX_SENT_LEN = 384   # Maximum sentence length of example inputs
 NAME_DIM = 384       # Dimension of concept name embeddings
 LSTM_HIDDEN_DIM = 256
 LSTM_NUM_LAYERS = 2

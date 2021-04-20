@@ -8,3 +8,4 @@ __email__ = "bornoriginal1@gmail.com"
 from .iob_hi import IOB_HI
 from .iob_lo import IOB_LO
 from .iob_one import IOB_ONE
+from .utils import Entity, Entities

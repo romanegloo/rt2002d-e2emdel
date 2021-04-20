@@ -69,8 +69,8 @@ class EvalMM:
                 predictions, _, _, _ = self.model(batch[:5],
                                                   self.norm_space,
                                                   pred_lvl_m=True)
-                self.compute_retrieval_metrics(predictions, batch[5])
-                self.error_analysis(predictions, batch)
+                self.compute_retrieval_metrics(predictions, batch[5], batch)
+                # self.error_analysis(predictions, batch)
                 e = 'tp {} fp {} fn {}'.format(*list(self.metrics['t2'].values()))
                 pbar.set_description(e)
                 pbar.update()
@@ -92,7 +92,15 @@ class EvalMM:
         gt, pred = self.get_gt_pred(predictions, annotations)
         # for k in gt:
         #     if k not in predictions:
-        #         code.interact(local=dict(globals(), **locals()))
+        #         print(k, gt[k])
+        #         print(cuis[gt[k][2]].names[:3])
+        #         tokens = tokenizer.convert_ids_to_tokens(batch[0][k[0]])
+        #         print(tokens[max(0, k[1]-5):k[1]+5])
+        #         for pred_k, v in predictions.items():
+        #             if pred_k[0] == k[0] and k[1]-5 <= pred_k[1] <= k[1]+5:
+        #                 print(pred_k, v)
+        #         code.interact(banner='====================',
+        #                       local=dict(globals(), **locals()))
 
         for k, (l, t, e) in pred.items():
             if k in gt and l == gt[k][0]:
@@ -111,7 +119,7 @@ class EvalMM:
                     j = self.st.index(cuis[e].st_root)
                     self.miss_matrix[i][j] += 1
 
-    def compute_retrieval_metrics(self, predictions, annotations):
+    def compute_retrieval_metrics(self, predictions, annotations, batch):
         gt, pred = self.get_gt_pred(predictions, annotations)
         metrics = {
             't0': {'tp': 0, 'fp': 0, 'fn': 0},
@@ -133,11 +141,32 @@ class EvalMM:
                     metrics['t2']['tp'] += 1
                 else:
                     metrics['t2']['fp'] += 1
+                    fp_ratio[0] += 1
+
             else:  # fp^o
-                if not (e in self.ds.cui2idx and self.ds.cui2idx[e]['tst_exc']):
+                if self.args.zero_shot and \
+                        not (e in self.ds.cui2idx and
+                             self.ds.cui2idx[e]['tst_exc']):
                     continue
                 for ck in metrics:
                     metrics[ck]['fp'] += 1
+                partial_match = False
+                for gt_k, v in gt.items():
+                    if gt_k[0] != k[0]:
+                        continue
+                    # partial matches
+                    if k[1] <= gt_k[1] < k[1] + l or \
+                            k[1] <= gt_k[1] + gt[gt_k][0] <= k[1] + l:
+                        partial_match = True
+                        break
+                if partial_match:
+                    fp_ratio[1] += 1
+                else:
+                    fp_ratio[2] += 1
+                    tokens = tokenizer.convert_ids_to_tokens(batch[0][k[0]])
+                    print(tokens)
+                    print(k, e)
+                    code.interact(local=dict(globals(), **locals()))
         for ck in metrics:
             if self.args.zero_shot:
                 n = sum([1 for k, annt in gt.items()
@@ -173,10 +202,6 @@ class EvalMM:
                  if not (m[2] in self.ds.cui2idx and
                          self.ds.cui2idx[m[2]]['tst_exc'])]
         for k, (l, t, e) in predictions.items():
-            # # right trim
-            # if l >= 2 and (t[-1] != t[-2] or e[-1] != e[-2]):
-            #     t = t[:-1]
-            #     e = e[:-1]
             # remove unclassified mentions
             t = [v for v in t if v != t1_nill]
             e = [v for v in e if v != t2_nill]
@@ -264,4 +289,6 @@ if __name__ == '__main__':
     evaluator.load_model()
 
     # Run~!
+    fp_ratio = [0, 0, 0]
     evaluator.test_mm()
+    code.interact(local=dict(globals(), **locals()))

@@ -356,7 +356,7 @@ def build_name_space():
             pbar.update()
             if sum(c.mm_count) == 0:
                 continue
-            for name in c.names[-3:]:
+            for name in c.names[:3]:
                 inp = tokenizer.encode(name[:args.max_name_len])
                 ni2cui.append((len(ni2cui), k, c.mm_count))
                 batch.append((torch.tensor(inp), c.st_root))
